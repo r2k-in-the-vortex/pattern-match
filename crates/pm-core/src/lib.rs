@@ -15,6 +15,7 @@ pub mod geometry;
 pub mod gradient;
 pub mod gray;
 pub mod model;
+pub mod overlay;
 pub mod pyramid;
 pub mod refine;
 pub mod score;
@@ -22,6 +23,13 @@ pub mod search;
 pub mod segment;
 
 pub use error::{Error, Result};
+pub use feature::{
+    Corner, EdgeChain, EdgePoint, EdgeSet, FeatureParams, FeatureSet, Segment, extract_features,
+};
+pub use gray::{GrayF32, LoadedImage, load_image};
+pub use image::RgbaImage;
+pub use overlay::{OverlayOptions, render_overlay};
+pub use pyramid::Pyramid;
 
 /// Version of the `pm-core` crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

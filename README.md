@@ -6,12 +6,12 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M1 complete.** The Lean geometry specification G1–G8
-(`lean/PatternMatch/Geometry.lean`) is proved with no `sorry`, Lean emits the
-geometry golden vectors, and `pm-core::geometry` implements similarity and
-homography algebra, pose extraction, cross-ratio, and collinearity with
-conformance tests against those vectors. Image processing begins at M2. This
-document is the implementation plan and the record of decisions made.
+**Status: M2 complete.** The image pipeline (grayscale/color/16-bit I/O,
+Gaussian pyramid, Scharr gradients, subpixel edges, Shi–Tomasi corners, and
+split-and-merge segments) and the feature overlay are implemented in `pm-core`.
+The desktop UI loads an image, runs default feature extraction, and displays
+the hue-coded overlay. Teaching tools begin at M3. This document is the
+implementation plan and the record of decisions made.
 
 ---
 
@@ -195,6 +195,7 @@ pattern-match/
 │  │  │  ├─ segment.rs
 │  │  │  ├─ descriptor.rs     # corner shape context, segment-pair invariants
 │  │  │  ├─ feature.rs        # feature records, masks, weights
+│  │  │  ├─ overlay.rs        # feature overlay rendering
 │  │  │  ├─ model.rs          # teaching, model I/O
 │  │  │  ├─ geometry.rs       # similarity, homography, DLT, poses
 │  │  │  ├─ search.rs         # Hough hypotheses, coarse-to-fine
@@ -237,6 +238,7 @@ pattern-match/
 | `segment` | Split-and-merge/RANSAC line fitting over edge chains. |
 | `descriptor` | Rotation/scale-invariant corner shape-context descriptors and segment-pair invariants for hypothesis seeding. |
 | `feature` | Feature records, weights, mask rasterization and exclusion. |
+| `overlay` | Feature overlay rendering: hue-coded edge strokes, corner crosses, segment lines. |
 | `model` | Build model at pyramid levels, validate, save/load `.pmodel`. |
 | `geometry` | Similarity/homography algebra, DLT, normalization, pose extraction, degeneracy checks. |
 | `search` | Oriented Hough voting, peak extraction, hypothesis generation and clustering. |
