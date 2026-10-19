@@ -6,8 +6,9 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: design phase.** This document is the implementation plan and the record of
-decisions made. No code exists yet.
+**Status: M0 scaffold complete.** The Cargo workspace, crate skeletons, Lean project,
+and scripts build cleanly. Detection and proof code begins at M1. This document is the
+implementation plan and the record of decisions made.
 
 ---
 

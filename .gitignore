@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Lean
+/lean/.lake/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Generated artifacts
+testdata/synthetic/*.png
+overlays/
+results/
