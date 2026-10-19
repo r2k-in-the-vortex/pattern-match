@@ -6,9 +6,12 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M0 scaffold complete.** The Cargo workspace, crate skeletons, Lean project,
-and scripts build cleanly. Detection and proof code begins at M1. This document is the
-implementation plan and the record of decisions made.
+**Status: M1 complete.** The Lean geometry specification G1–G8
+(`lean/PatternMatch/Geometry.lean`) is proved with no `sorry`, Lean emits the
+geometry golden vectors, and `pm-core::geometry` implements similarity and
+homography algebra, pose extraction, cross-ratio, and collinearity with
+conformance tests against those vectors. Image processing begins at M2. This
+document is the implementation plan and the record of decisions made.
 
 ---
 

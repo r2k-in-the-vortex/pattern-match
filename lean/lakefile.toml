@@ -3,9 +3,9 @@ version = "0.1.0"
 defaultTargets = ["PatternMatch", "golden"]
 
 # Mathlib is pinned to the release supporting the toolchain in lean-toolchain.
-# M0 modules do not import Mathlib, so `lake build` stays fast. Before the M1
-# proofs are built for the first time, run `lake exe cache get` in this directory
-# to download the prebuilt oleans (README §10.1).
+# M1 imports only the Mathlib modules it needs. Run `lake exe cache get` in this
+# directory before the first Mathlib-dependent build to download prebuilt oleans
+# (README §10.1); afterwards it is not needed.
 [[require]]
 name = "mathlib"
 git = "https://github.com/leanprover-community/mathlib4.git"
