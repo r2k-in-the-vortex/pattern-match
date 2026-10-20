@@ -6,12 +6,13 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M2 complete.** The image pipeline (grayscale/color/16-bit I/O,
-Gaussian pyramid, Scharr gradients, subpixel edges, Shi–Tomasi corners, and
-split-and-merge segments) and the feature overlay are implemented in `pm-core`.
-The desktop UI loads an image, runs default feature extraction, and displays
-the hue-coded overlay. Teaching tools begin at M3. This document is the
-implementation plan and the record of decisions made.
+**Status: M3 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
+polygon and brush masks with undo/redo, live feature preview, and `.pmodel`
+save/load. Models store model-frame features, three-scale corner descriptors,
+segment-pair invariants, mask primitives, and a derived mask raster; a
+save/reload round-trip reproduces them exactly. Formal DLT/RANSAC work begins
+at M4. This document is the implementation plan and the record of decisions
+made.
 
 ---
 
@@ -194,7 +195,8 @@ pattern-match/
 │  │  │  ├─ corner.rs         # Shi–Tomasi + subpixel
 │  │  │  ├─ segment.rs
 │  │  │  ├─ descriptor.rs     # corner shape context, segment-pair invariants
-│  │  │  ├─ feature.rs        # feature records, masks, weights
+│  │  │  ├─ feature.rs        # feature records, filtering, weights
+│  │  │  ├─ mask.rs           # mask primitives and rasterization
 │  │  │  ├─ overlay.rs        # feature overlay rendering
 │  │  │  ├─ model.rs          # teaching, model I/O
 │  │  │  ├─ geometry.rs       # similarity, homography, DLT, poses
@@ -237,7 +239,8 @@ pattern-match/
 | `corner` | Shi–Tomasi/Harris response, NMS, subpixel refinement. |
 | `segment` | Split-and-merge/RANSAC line fitting over edge chains. |
 | `descriptor` | Rotation/scale-invariant corner shape-context descriptors and segment-pair invariants for hypothesis seeding. |
-| `feature` | Feature records, weights, mask rasterization and exclusion. |
+| `feature` | Feature records, weights, filtering, and preview support. |
+| `mask` | Mask primitives in model coordinates, add/erase rasterization, and feature exclusion. |
 | `overlay` | Feature overlay rendering: hue-coded edge strokes, corner crosses, segment lines. |
 | `model` | Build model at pyramid levels, validate, save/load `.pmodel`. |
 | `geometry` | Similarity/homography algebra, DLT, normalization, pose extraction, degeneracy checks. |
@@ -408,9 +411,10 @@ A ZIP archive with a versioned manifest and binary payloads:
 
 ```text
 model.json          # version, metadata, ROI, zero frame, parameters, mask primitives
-features.bin        # documented little-endian arrays: levels, edges, corners, segments, descriptors
+features.bin        # little-endian level-0 features, descriptors, segment pairs
 mask.png            # optional rasterized mask (derived, for fast display)
-source.png          # optional embedded source image / thumbnail
+source.png          # optional embedded 16-bit grayscale working source
+display.png         # optional 8-bit RGBA display copy of the source
 ```
 
 `model.json` is human-inspectable; `features.bin` avoids JSON bloat. The manifest

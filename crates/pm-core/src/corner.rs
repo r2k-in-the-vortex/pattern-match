@@ -1,11 +1,13 @@
 //! Shi–Tomasi corner response, NMS, and subpixel refinement (README §7.2).
 
+use serde::{Deserialize, Serialize};
+
 use crate::feature::Corner;
 use crate::gradient::GradientField;
 use crate::gray::GrayF32;
 
 /// Corner extraction parameters.  Defaults follow README Appendix A.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CornerParams {
     /// Accepted response as a fraction of the strongest response.
     pub quality: f32,

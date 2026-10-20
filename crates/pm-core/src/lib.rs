@@ -14,6 +14,7 @@ pub mod feature;
 pub mod geometry;
 pub mod gradient;
 pub mod gray;
+pub mod mask;
 pub mod model;
 pub mod overlay;
 pub mod pyramid;
@@ -22,12 +23,19 @@ pub mod score;
 pub mod search;
 pub mod segment;
 
+pub use descriptor::{
+    CornerDescriptor, SegmentPairInvariant, describe_corners, segment_pair_invariants,
+};
 pub use error::{Error, Result};
 pub use feature::{
     Corner, EdgeChain, EdgePoint, EdgeSet, FeatureParams, FeatureSet, Segment, extract_features,
+    filter_features,
 };
+pub use geometry::{RotatedRect, ZeroFrame};
 pub use gray::{GrayF32, LoadedImage, load_image};
 pub use image::RgbaImage;
+pub use mask::{MaskBounds, MaskPrimitive, MaskRaster};
+pub use model::{HypothesisSources, Model, SearchDefaults, TeachSettings, mask_bounds_for};
 pub use overlay::{OverlayOptions, render_overlay};
 pub use pyramid::Pyramid;
 

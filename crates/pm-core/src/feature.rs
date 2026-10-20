@@ -2,6 +2,8 @@
 //! pipeline (README §7).  Mask rasterization and exclusion arrive with the
 //! teaching tools in M3.
 
+use serde::{Deserialize, Serialize};
+
 use crate::corner::{CornerParams, detect_corners};
 use crate::edge::{EdgeParams, extract_edges};
 use crate::gradient::GradientField;
@@ -121,7 +123,7 @@ impl FeatureSet {
 /// Parameters for the full feature extraction pipeline.
 ///
 /// Defaults follow README Appendix A.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FeatureParams {
     /// Full-resolution Gaussian blur before gradients.
     pub blur_sigma: f32,
@@ -175,6 +177,82 @@ pub fn extract_features(image: &GrayF32, params: &FeatureParams) -> FeatureSet {
     };
     FeatureSet {
         edges,
+        corners,
+        segments,
+    }
+}
+
+/// Keep only features whose representative point satisfies `keep`.
+///
+/// Edge points are filtered individually; chains are remapped and empty chains
+/// are removed.  Corners use their center; segments use their midpoint.
+#[must_use]
+pub fn filter_features(
+    features: &FeatureSet,
+    mut keep: impl FnMut(f32, f32) -> bool,
+) -> FeatureSet {
+    let mut point_keep = vec![false; features.edges.points.len()];
+    for (index, point) in features.edges.points.iter().enumerate() {
+        point_keep[index] = keep(point.x, point.y);
+    }
+
+    let mut kept_chains = Vec::new();
+    let mut referenced = vec![false; features.edges.points.len()];
+    for chain in &features.edges.chains {
+        let mut indices = Vec::with_capacity(chain.points.len());
+        for &index in &chain.points {
+            if point_keep.get(index).copied().unwrap_or(false) {
+                referenced[index] = true;
+                indices.push(index);
+            }
+        }
+        if !indices.is_empty() {
+            kept_chains.push(EdgeChain {
+                id: chain.id,
+                points: indices,
+            });
+        }
+    }
+
+    let mut old_to_new = vec![usize::MAX; features.edges.points.len()];
+    let mut points = Vec::new();
+    for (index, point) in features.edges.points.iter().enumerate() {
+        if referenced[index] {
+            old_to_new[index] = points.len();
+            points.push(*point);
+        }
+    }
+    for chain in &mut kept_chains {
+        chain.points = chain
+            .points
+            .iter()
+            .map(|&index| old_to_new[index])
+            .collect();
+    }
+
+    let corners = features
+        .corners
+        .iter()
+        .copied()
+        .filter(|corner| keep(corner.x, corner.y))
+        .collect();
+    let segments = features
+        .segments
+        .iter()
+        .copied()
+        .filter(|segment| {
+            keep(
+                (segment.x0 + segment.x1) * 0.5,
+                (segment.y0 + segment.y1) * 0.5,
+            )
+        })
+        .collect();
+
+    FeatureSet {
+        edges: EdgeSet {
+            points,
+            chains: kept_chains,
+        },
         corners,
         segments,
     }
@@ -244,5 +322,25 @@ mod tests {
         assert!(features.edge_count() > 0);
         assert_eq!(features.corner_count(), 0);
         assert_eq!(features.segment_count(), 0);
+    }
+
+    #[test]
+    fn filter_features_remaps_chains() {
+        let image = plate_image(80, 64);
+        let features = extract_features(&image, &FeatureParams::default());
+        let filtered = filter_features(&features, |x, _| x < 40.0);
+        assert!(filtered.edge_count() > 0);
+        assert!(filtered.edges.points.iter().all(|p| p.x < 40.0));
+        assert!(filtered.corners.iter().all(|c| c.x < 40.0));
+        for chain in &filtered.edges.chains {
+            assert!(!chain.points.is_empty());
+            for &index in &chain.points {
+                assert!(index < filtered.edges.points.len());
+                assert_eq!(
+                    filtered.edges.points[index].chain_id, chain.id,
+                    "chain id mismatch"
+                );
+            }
+        }
     }
 }

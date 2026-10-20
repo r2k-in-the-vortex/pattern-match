@@ -3,11 +3,13 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::feature::{EdgeChain, EdgePoint, EdgeSet};
 use crate::gradient::GradientField;
 
 /// Edge extraction parameters.  Defaults follow README Appendix A.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EdgeParams {
     /// Percentile of the gradient magnitude used for the adaptive high threshold.
     pub high_percentile: f32,

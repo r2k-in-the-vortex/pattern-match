@@ -361,6 +361,17 @@ pub struct LoadedImage {
     pub display: RgbaImage,
 }
 
+impl LoadedImage {
+    /// Build the working and display representations from a decoded image.
+    pub fn from_dynamic_image(decoded: DynamicImage) -> Result<Self> {
+        let gray = GrayF32::from_dynamic_image(&decoded)?;
+        Ok(Self {
+            gray,
+            display: decoded.to_rgba8(),
+        })
+    }
+}
+
 /// Decode an image file into the working grayscale representation and a display
 /// copy.  The display copy is 8-bit RGBA even for 16-bit inputs.
 pub fn load_image(path: impl AsRef<Path>) -> Result<LoadedImage> {
@@ -371,11 +382,7 @@ pub fn load_image(path: impl AsRef<Path>) -> Result<LoadedImage> {
         .map_err(|err| Error::Image(format!("detect format {}: {err}", path.display())))?
         .decode()
         .map_err(|err| Error::Image(format!("decode {}: {err}", path.display())))?;
-    let gray = GrayF32::from_dynamic_image(&decoded)?;
-    Ok(LoadedImage {
-        gray,
-        display: decoded.to_rgba8(),
-    })
+    LoadedImage::from_dynamic_image(decoded)
 }
 
 /// A normalized 1-D Gaussian kernel.

@@ -1,10 +1,12 @@
 //! Line-segment fitting over ordered edge chains using split-and-merge
 //! (README §7.3).
 
+use serde::{Deserialize, Serialize};
+
 use crate::feature::{EdgeSet, Segment};
 
 /// Segment fitting parameters.  Defaults follow README Appendix A.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SegmentParams {
     /// Minimum endpoint distance in pixels.
     pub min_length: f32,

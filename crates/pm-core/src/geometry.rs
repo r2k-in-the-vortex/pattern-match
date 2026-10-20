@@ -21,6 +21,7 @@
 //! DLT arrives in M4.
 
 use nalgebra::{Matrix2, Matrix3, Vector2, Vector3};
+use serde::{Deserialize, Serialize};
 
 /// Numerical tolerance for treating a homogeneous coordinate or determinant as
 /// zero.  The exact statements in the Lean specification use `≠ 0`; the Rust
@@ -320,6 +321,179 @@ pub fn det_points(p: Vector3<f64>, q: Vector3<f64>, r: Vector3<f64>) -> f64 {
     Matrix3::from_columns(&[p, q, r]).determinant()
 }
 
+/// A rotated rectangle in image coordinates (README §4).
+///
+/// The rectangle is stored as center, width, height, and angle in radians.  The
+/// local x-axis is the rectangle's width direction.  Positive angles appear
+/// clockwise on screen because image `y` points down.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RotatedRect {
+    /// Center x.
+    pub cx: f32,
+    /// Center y.
+    pub cy: f32,
+    /// Full width along the local x-axis.
+    pub width: f32,
+    /// Full height along the local y-axis.
+    pub height: f32,
+    /// Rotation angle in radians.
+    pub angle: f32,
+}
+
+impl RotatedRect {
+    /// Construct a rectangle.
+    #[must_use]
+    pub fn new(cx: f32, cy: f32, width: f32, height: f32, angle: f32) -> Self {
+        Self {
+            cx,
+            cy,
+            width,
+            height,
+            angle,
+        }
+    }
+
+    /// Whether the rectangle has finite, positive dimensions.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.cx.is_finite()
+            && self.cy.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.angle.is_finite()
+            && self.width > 0.0
+            && self.height > 0.0
+    }
+
+    /// The four corners in image coordinates, counter-clockwise in the local
+    /// frame: `(-w/2,-h/2)`, `(w/2,-h/2)`, `(w/2,h/2)`, `(-w/2,h/2)`.
+    #[must_use]
+    pub fn corners(&self) -> [[f32; 2]; 4] {
+        let (sin, cos) = self.angle.sin_cos();
+        let hw = self.width * 0.5;
+        let hh = self.height * 0.5;
+        let local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
+        local.map(|(x, y)| [self.cx + cos * x - sin * y, self.cy + sin * x + cos * y])
+    }
+
+    /// Map a point from the rectangle's local frame to image coordinates.
+    #[must_use]
+    pub fn local_to_image(&self, p: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        [
+            self.cx + cos * p[0] - sin * p[1],
+            self.cy + sin * p[0] + cos * p[1],
+        ]
+    }
+
+    /// Map an image point into the rectangle's local frame.
+    #[must_use]
+    pub fn image_to_local(&self, p: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        let dx = p[0] - self.cx;
+        let dy = p[1] - self.cy;
+        [cos * dx + sin * dy, -sin * dx + cos * dy]
+    }
+
+    /// Whether an image point lies inside the rectangle (inclusive boundary).
+    #[must_use]
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        let local = self.image_to_local([x, y]);
+        local[0].abs() <= self.width * 0.5 && local[1].abs() <= self.height * 0.5
+    }
+
+    /// Axis-aligned image bounds `[min_x, min_y, max_x, max_y]`.
+    #[must_use]
+    pub fn bounds(&self) -> [f32; 4] {
+        let corners = self.corners();
+        let mut bounds = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for corner in corners {
+            bounds[0] = bounds[0].min(corner[0]);
+            bounds[1] = bounds[1].min(corner[1]);
+            bounds[2] = bounds[2].max(corner[0]);
+            bounds[3] = bounds[3].max(corner[1]);
+        }
+        bounds
+    }
+}
+
+/// The model zero frame: origin and x-axis direction in image coordinates
+/// (README §4).  `p_model = R(-angle) · (p_image - origin)`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ZeroFrame {
+    /// Origin in image coordinates.
+    pub origin: [f32; 2],
+    /// Model x-axis angle in image coordinates, in radians.
+    pub angle: f32,
+}
+
+impl ZeroFrame {
+    /// Zero at the image origin with the image axes.
+    #[must_use]
+    pub fn identity() -> Self {
+        Self {
+            origin: [0.0, 0.0],
+            angle: 0.0,
+        }
+    }
+
+    /// Whether the frame is finite.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.origin[0].is_finite() && self.origin[1].is_finite() && self.angle.is_finite()
+    }
+
+    /// Image point to model coordinates.
+    #[must_use]
+    pub fn to_model(&self, p: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        let dx = p[0] - self.origin[0];
+        let dy = p[1] - self.origin[1];
+        [cos * dx + sin * dy, -sin * dx + cos * dy]
+    }
+
+    /// Model point to image coordinates.
+    #[must_use]
+    pub fn to_image(&self, p: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        [
+            self.origin[0] + cos * p[0] - sin * p[1],
+            self.origin[1] + sin * p[0] + cos * p[1],
+        ]
+    }
+
+    /// Rotate a direction from image to model coordinates.
+    #[must_use]
+    pub fn vector_to_model(&self, v: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        [cos * v[0] + sin * v[1], -sin * v[0] + cos * v[1]]
+    }
+
+    /// Rotate a direction from model to image coordinates.
+    #[must_use]
+    pub fn vector_to_image(&self, v: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        [cos * v[0] - sin * v[1], sin * v[0] + cos * v[1]]
+    }
+
+    /// Map an image-frame angle to the model frame.
+    #[must_use]
+    pub fn angle_to_model(&self, angle: f32) -> f32 {
+        angle - self.angle
+    }
+
+    /// Map a model-frame angle to the image frame.
+    #[must_use]
+    pub fn angle_to_image(&self, angle: f32) -> f32 {
+        angle + self.angle
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +758,65 @@ mod tests {
             Homography::from_matrix(Matrix3::new(2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0));
         let n = at_infinity.normalized_for_output();
         assert_close(n.norm(), 1.0, "Frobenius normalization");
+    }
+}
+
+#[cfg(test)]
+mod teach_geometry_tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
+    }
+
+    #[test]
+    fn rotated_rect_contains_points_in_local_frame() {
+        let rect = RotatedRect::new(10.0, 20.0, 8.0, 4.0, std::f32::consts::FRAC_PI_2);
+        assert!(rect.contains(10.0, 20.0));
+        assert!(rect.contains(12.0, 20.0));
+        assert!(rect.contains(8.0, 20.0));
+        assert!(!rect.contains(16.0, 20.0));
+        assert!(!rect.contains(10.0, 26.0));
+        assert!(rect.is_valid());
+        let bounds = rect.bounds();
+        assert!((bounds[0] - 8.0).abs() < 1e-4);
+        assert!((bounds[2] - 12.0).abs() < 1e-4);
+        assert!((bounds[1] - 16.0).abs() < 1e-4);
+        assert!((bounds[3] - 24.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rotated_rect_local_roundtrip() {
+        let rect = RotatedRect::new(-3.0, 7.5, 11.0, 5.5, 0.37);
+        for p in [[0.0, 0.0], [4.5, -2.0], [-1.0, 2.75]] {
+            let image = rect.local_to_image(p);
+            let local = rect.image_to_local(image);
+            assert_close(local[0], p[0]);
+            assert_close(local[1], p[1]);
+        }
+        let corners = rect.corners();
+        for corner in corners {
+            assert!(rect.contains(corner[0], corner[1]));
+        }
+    }
+
+    #[test]
+    fn zero_frame_roundtrip() {
+        let zero = ZeroFrame {
+            origin: [12.5, -4.0],
+            angle: 0.62,
+        };
+        let image = [30.0, 18.0];
+        let model = zero.to_model(image);
+        let back = zero.to_image(model);
+        assert_close(back[0], image[0]);
+        assert_close(back[1], image[1]);
+
+        let direction = [0.8f32, -0.6];
+        let model_v = zero.vector_to_model(direction);
+        let back_v = zero.vector_to_image(model_v);
+        assert_close(back_v[0], direction[0]);
+        assert_close(back_v[1], direction[1]);
+        assert_close(model_v[0].hypot(model_v[1]), 1.0);
     }
 }
