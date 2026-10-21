@@ -27,6 +27,9 @@ image is opened, detection runs off the UI thread with stage progress and cancel
 and each detection is presented both as data (results table, JSON/CSV) and on the
 canvas (transformed ROI outline, zero frame, matched edges). The detector exposes an
 optional progress/cancellation hook; with no hook attached, results are unchanged.
+Validating run mode against a six-instance still image also made coarse candidate
+selection diversity-aware, so the fixed verification budget is spent on distinct poses
+rather than duplicate rotation/scale-bin seeds (§9.4).
 
 The detector is a hybrid similarity search: pyramid oriented Hough voting,
 corner-descriptor and segment-pair seeding, pose clustering, edge-distance
@@ -600,6 +603,15 @@ angle within a few degrees, and scale within a small ratio. Representatives keep
 best source-specific seed score. Clustering reduces the number of candidates to
 roughly 50–300 per image, which are then scored coarse-to-fine. The winning
 hypothesis records its source for diagnostics.
+
+The top candidates are then selected with a greedy pose-diversity pass before full
+verification: after coarse scoring, a lower-ranked seed is skipped when a
+higher-ranked seed predicts the same occurrence under the detection-NMS pose gates
+(translation relative to the model diagonal and the larger scale, directed angle, and
+scale ratio). This spends the fixed verification budget on distinct occurrences rather
+than on several rotation/scale-bin variants of the strongest objects. ROI overlap is
+not used for this gate because coarse seeds are unrefined; a nearby false seed would
+otherwise suppress the true seed of a real instance.
 
 ### 9.5 Scoring
 
@@ -1262,7 +1274,7 @@ same run state.
 | Corner descriptor | shape context 5×12 log-polar + 8 orientation bins; radii 12/24/48 px; ratio test 0.8 |
 | Descriptor caps | 300 model corners, 600 test corners per level |
 | Segment-pair caps | 500 pairs per image; non-parallel pairs only |
-| Hypothesis cap | 150 after clustering; top 24 by coarse score verified |
+| Hypothesis cap | 150 after clustering; top 24 distinct poses by coarse score verified (greedy pose-diversity selection) |
 | Score `τ_d` | 2.5 px full resolution, scaled by level |
 | Score orientation exponent | 2 |
 | Coverage minimum | 0.4 |

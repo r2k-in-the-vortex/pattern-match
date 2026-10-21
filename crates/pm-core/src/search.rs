@@ -478,12 +478,14 @@ pub fn detect_with_progress(
         return Err(Error::Cancelled);
     }
     let generated = hypotheses.len();
-    let clustered = cluster_hypotheses(hypotheses, model_roi_diagonal(model), params);
+    let model_diagonal = model_roi_diagonal(model);
+    let clustered = cluster_hypotheses(hypotheses, model_diagonal, params);
     let ranked = rank_hypotheses(
         clustered,
         &test.levels[coarse_level],
         &model_levels[coarse_level],
         coarse_level,
+        model_diagonal,
         params,
         progress,
     );
@@ -531,7 +533,7 @@ pub fn detect_with_progress(
     });
     let detections = non_maximum_suppression(
         detections,
-        model_roi_diagonal(model),
+        model_diagonal,
         &roi_model,
         params.max_detections,
         &params.nms,
@@ -1251,6 +1253,7 @@ fn rank_hypotheses(
     level: &TestLevel,
     model_points: &[EdgePoint],
     level_index: usize,
+    model_diagonal: f32,
     params: &SearchParams,
     progress: &dyn ProgressSink,
 ) -> Vec<Hypothesis> {
@@ -1302,11 +1305,58 @@ fn rank_hypotheses(
     let best = scored.first().map_or(0.0, |(score, _)| *score);
     let floor = (best * 0.4).max(0.12);
     scored.retain(|(score, _)| *score >= floor);
-    scored.truncate(params.max_hypotheses_scored.max(1));
-    scored
+
+    // Greedy diversity selection: spend the verification budget on distinct
+    // occurrences rather than on several seeds for the same object.  A
+    // higher-ranked hypothesis suppresses a lower-ranked one under the same
+    // pose gates as detection NMS.  ROI overlap is deliberately omitted:
+    // coarse seeds are unrefined, and a nearby false seed would otherwise
+    // suppress the true seed for a real instance.
+    let limit = params.max_hypotheses_scored.max(1);
+    let mut selected: Vec<(f32, Hypothesis)> = Vec::with_capacity(limit.min(scored.len()));
+    for (score, hypothesis) in scored {
+        if selected.len() >= limit {
+            break;
+        }
+        let duplicate = selected
+            .iter()
+            .any(|(_, kept)| coarse_seed_duplicate(kept, &hypothesis, model_diagonal, &params.nms));
+        if !duplicate {
+            selected.push((score, hypothesis));
+        }
+    }
+    selected
         .into_iter()
         .map(|(_, hypothesis)| hypothesis)
         .collect()
+}
+
+/// Whether two coarse hypotheses predict the same occurrence.
+///
+/// The test mirrors the detection NMS pose gates: translation within
+/// `distance_fraction` of the model diagonal at the larger scale, a directed
+/// angle within `angle_threshold`, and a scale ratio below `1 + scale_ratio`.
+fn coarse_seed_duplicate(
+    a: &Hypothesis,
+    b: &Hypothesis,
+    model_diagonal: f32,
+    nms: &NmsParams,
+) -> bool {
+    if !a.pose.is_finite() || !b.pose.is_finite() {
+        return false;
+    }
+    let distance = (a.pose.tx - b.pose.tx).hypot(a.pose.ty - b.pose.ty);
+    let scale = a.pose.scale.max(b.pose.scale).max(1e-3);
+    if distance >= f64::from(nms.distance_fraction * model_diagonal) * scale {
+        return false;
+    }
+    let angle = (a.pose.theta - b.pose.theta).rem_euclid(std::f64::consts::TAU);
+    let angle = angle.min(std::f64::consts::TAU - angle);
+    if angle >= f64::from(nms.angle_threshold) {
+        return false;
+    }
+    let ratio = (a.pose.scale / b.pose.scale).max(b.pose.scale / a.pose.scale);
+    ratio < f64::from(1.0 + nms.scale_ratio)
 }
 
 #[allow(clippy::too_many_arguments)]
