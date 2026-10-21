@@ -22,6 +22,10 @@ pub enum Error {
     /// A numerical routine failed to produce a usable result.
     #[error("numerical failure: {0}")]
     Numerical(String),
+
+    /// The caller cancelled a long-running operation through its progress hook.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Convenience alias for results returned by `pm-core`.

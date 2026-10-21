@@ -2,7 +2,7 @@
 //!
 //! The crate is independent of the UI and file dialogs. The module layout
 //! follows the architecture in the project plan (README §5.2). Detection and
-//! model functionality through M6 is implemented; `capture` remains a stub
+//! model functionality through M7.5 is implemented; `capture` remains a stub
 //! until the webcam milestone.
 
 pub mod capture;
@@ -61,8 +61,9 @@ pub use score::{
     non_maximum_suppression, score_homography, score_similarity,
 };
 pub use search::{
-    DetectionResult, Hypothesis, SearchParams, SearchTimings, TestLevel, TestPyramid, detect,
-    hough_hypotheses, model_roi_in_model_coords,
+    DetectStage, DetectionResult, Hypothesis, IgnoreProgress, ProgressSink, SearchParams,
+    SearchTimings, TestLevel, TestPyramid, detect, detect_with_progress, hough_hypotheses,
+    model_roi_in_model_coords,
 };
 pub use synthetic::{
     BENCHMARK_FORMAT, BENCHMARK_VERSION, BenchmarkMetrics, BenchmarkReport, ScenarioReport,

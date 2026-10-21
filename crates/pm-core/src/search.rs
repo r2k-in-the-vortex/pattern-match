@@ -8,6 +8,7 @@
 //! homography, and a validation gate either accepts it or reports the
 //! similarity embedding as the auditable fallback.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use nalgebra::Vector2;
@@ -38,6 +39,63 @@ use crate::segment::fit_segments;
 
 /// Number of directed orientation buckets in Hough voting.
 pub const HOUGH_ORIENTATION_BUCKETS: usize = 32;
+
+/// Stage of the detection pipeline reported to a [`ProgressSink`]
+/// (README §11.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectStage {
+    /// Blurred base image and Gaussian pyramid construction.
+    Preprocess,
+    /// Gradients, edges, distance fields, corners, and segments.
+    Edges,
+    /// Hough voting plus descriptor and segment seeding.
+    Search,
+    /// Hypothesis verification and refinement.
+    Verify,
+    /// Similarity refinement and non-maximum suppression.
+    Refine,
+    /// Homography correspondence assembly, RANSAC, and LM refinement.
+    Homography,
+}
+
+impl DetectStage {
+    /// Stable display name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preprocess => "preprocess",
+            Self::Edges => "edges",
+            Self::Search => "Hough/descriptor seeding",
+            Self::Verify => "verify",
+            Self::Refine => "refine",
+            Self::Homography => "homography",
+        }
+    }
+}
+
+/// Optional cooperative progress and cancellation hook for
+/// [`detect_with_progress`].
+///
+/// `progress` reports a stage and a whole-run fraction in `[0, 1]`.
+/// `cancelled` is polled between work units; returning `true` makes the
+/// detector return [`Error::Cancelled`] without producing a result.  The
+/// default implementations do nothing, so [`IgnoreProgress`] observes nothing
+/// and never cancels.
+pub trait ProgressSink: Send + Sync {
+    /// Report the active stage and whole-run fraction in `[0, 1]`.
+    fn progress(&self, _stage: DetectStage, _fraction: f32) {}
+
+    /// Whether the caller asked to abort the run.
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// A [`ProgressSink`] that reports nothing and never cancels.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IgnoreProgress;
+
+impl ProgressSink for IgnoreProgress {}
 
 /// A test image level with gradients, edges, distance field, and features.
 #[derive(Clone, Debug)]
@@ -71,8 +129,25 @@ pub struct TestPyramid {
 
 impl TestPyramid {
     /// Build the test pyramid and per-level features.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: this uses [`IgnoreProgress`], which cannot cancel.
     #[must_use]
     pub fn build(image: &crate::gray::GrayF32, levels: usize, params: &FeatureParams) -> Self {
+        Self::build_with_progress(image, levels, params, &IgnoreProgress)
+            .expect("IgnoreProgress never cancels")
+    }
+
+    /// Build the test pyramid, reporting progress and honouring cancellation
+    /// between pyramid levels.
+    pub fn build_with_progress(
+        image: &crate::gray::GrayF32,
+        levels: usize,
+        params: &FeatureParams,
+        progress: &dyn ProgressSink,
+    ) -> Result<Self> {
+        progress.progress(DetectStage::Preprocess, 0.0);
         let preprocess_start = Instant::now();
         let base = if params.blur_sigma > 0.01 {
             image.gaussian_blur(params.blur_sigma)
@@ -81,40 +156,50 @@ impl TestPyramid {
         };
         let pyramid = Pyramid::build(&base, levels);
         let preprocess_ms = duration_ms(preprocess_start);
+        if progress.cancelled() {
+            return Err(Error::Cancelled);
+        }
 
         let features_start = Instant::now();
-        let levels = (0..pyramid.len())
-            .map(|level| {
-                let gray = pyramid.level_unchecked(level).clone();
-                let gradient = GradientField::compute(&gray);
-                let edges = extract_edges(&gradient, &params.edge);
-                let distance = DistanceField::from_edges(&edges, gray.width, gray.height);
-                let corners = if params.detect_corners {
-                    detect_corners(&gradient, &params.corner)
-                } else {
-                    Vec::new()
-                };
-                let segments = if params.fit_segments {
-                    fit_segments(&edges, &params.segment)
-                } else {
-                    Vec::new()
-                };
-                TestLevel {
-                    level,
-                    gray,
-                    gradient,
-                    edges,
-                    distance,
-                    corners,
-                    segments,
-                }
-            })
-            .collect();
-        Self {
-            levels,
+        let level_count = pyramid.len().max(1);
+        let mut built = Vec::with_capacity(pyramid.len());
+        for level in 0..pyramid.len() {
+            if progress.cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let gray = pyramid.level_unchecked(level).clone();
+            let gradient = GradientField::compute(&gray);
+            let edges = extract_edges(&gradient, &params.edge);
+            let distance = DistanceField::from_edges(&edges, gray.width, gray.height);
+            let corners = if params.detect_corners {
+                detect_corners(&gradient, &params.corner)
+            } else {
+                Vec::new()
+            };
+            let segments = if params.fit_segments {
+                fit_segments(&edges, &params.segment)
+            } else {
+                Vec::new()
+            };
+            built.push(TestLevel {
+                level,
+                gray,
+                gradient,
+                edges,
+                distance,
+                corners,
+                segments,
+            });
+            progress.progress(
+                DetectStage::Edges,
+                0.02 + 0.28 * (level + 1) as f32 / level_count as f32,
+            );
+        }
+        Ok(Self {
+            levels: built,
             preprocess_ms,
             features_ms: duration_ms(features_start),
-        }
+        })
     }
 
     /// A level, or `None` when out of range.
@@ -295,10 +380,29 @@ pub struct DetectionResult {
 }
 
 /// Detect instances of `model` in `image` (README §9.1).
+///
+/// This is the default entry point.  It performs no progress reporting and
+/// cannot be cancelled; use [`detect_with_progress`] for a cooperative hook.
 pub fn detect(
     model: &Model,
     image: &crate::gray::GrayF32,
     params: &SearchParams,
+) -> Result<DetectionResult> {
+    detect_with_progress(model, image, params, &IgnoreProgress)
+}
+
+/// Detect instances with cooperative progress and cancellation (README §11.3).
+///
+/// The hook never changes which detections are produced: with a sink that never
+/// cancels, results are identical to [`detect`].  Cancellation is polled between
+/// pyramid levels, hypothesis batches, ranking work, and verification
+/// candidates; a cancelled run returns [`Error::Cancelled`] instead of a
+/// partially computed result.
+pub fn detect_with_progress(
+    model: &Model,
+    image: &crate::gray::GrayF32,
+    params: &SearchParams,
+    progress: &dyn ProgressSink,
 ) -> Result<DetectionResult> {
     let total_start = Instant::now();
     if image.is_empty() {
@@ -309,9 +413,12 @@ pub fn detect(
             "model has no edge features".to_owned(),
         ));
     }
+    if progress.cancelled() {
+        return Err(Error::Cancelled);
+    }
     let mut timings = SearchTimings::default();
 
-    let test = TestPyramid::build(image, 3, &model.params);
+    let test = TestPyramid::build_with_progress(image, 3, &model.params, progress)?;
     timings.preprocess_ms = test.preprocess_ms;
     timings.features_ms = test.features_ms;
     if test.levels.is_empty() {
@@ -328,34 +435,47 @@ pub fn detect(
         .collect();
 
     let search_start = Instant::now();
+    progress.progress(DetectStage::Search, 0.30);
     let mut hypotheses = Vec::new();
     if matches!(
         params.hypothesis_sources,
         HypothesisSources::Hough | HypothesisSources::Both
     ) {
-        hypotheses.extend(hough_hypotheses(
+        hypotheses.extend(hough_hypotheses_with_progress(
             model,
             &test.levels[coarse_level],
             coarse_level,
             params,
+            progress,
         ));
+    }
+    if progress.cancelled() {
+        return Err(Error::Cancelled);
     }
     if matches!(
         params.hypothesis_sources,
         HypothesisSources::Descriptors | HypothesisSources::Both
     ) {
-        hypotheses.extend(descriptor_hypotheses(
+        hypotheses.extend(descriptor_hypotheses_with_progress(
             model,
             &test.levels,
             coarse_level,
             params,
+            progress,
         ));
-        hypotheses.extend(segment_hypotheses(
+        if progress.cancelled() {
+            return Err(Error::Cancelled);
+        }
+        hypotheses.extend(segment_hypotheses_with_progress(
             model,
             &test.levels,
             coarse_level,
             params,
+            progress,
         ));
+    }
+    if progress.cancelled() {
+        return Err(Error::Cancelled);
     }
     let generated = hypotheses.len();
     let clustered = cluster_hypotheses(hypotheses, model_roi_diagonal(model), params);
@@ -365,12 +485,19 @@ pub fn detect(
         &model_levels[coarse_level],
         coarse_level,
         params,
+        progress,
     );
+    if progress.cancelled() {
+        return Err(Error::Cancelled);
+    }
     timings.search_ms = duration_ms(search_start);
 
     let refine_start = Instant::now();
+    progress.progress(DetectStage::Verify, 0.55);
     let hypotheses_scored = ranked.len();
     let roi_model = model_roi_in_model_coords(model);
+    let completed = AtomicUsize::new(0);
+    let total = ranked.len().max(1);
     let scored: Vec<Option<Detection>> = ranked
         .par_iter()
         .enumerate()
@@ -383,9 +510,15 @@ pub fn detect(
                 index,
                 hypothesis,
                 params,
+                progress,
+                &completed,
+                total,
             )
         })
         .collect();
+    if progress.cancelled() {
+        return Err(Error::Cancelled);
+    }
     timings.refine_ms = duration_ms(refine_start);
 
     let mut detections: Vec<Detection> = scored.into_iter().flatten().collect();
@@ -403,6 +536,7 @@ pub fn detect(
         params.max_detections,
         &params.nms,
     );
+    progress.progress(DetectStage::Refine, 1.0);
     timings.total_ms = duration_ms(total_start);
     Ok(DetectionResult {
         detections,
@@ -515,6 +649,16 @@ pub fn hough_hypotheses(
     level_index: usize,
     params: &SearchParams,
 ) -> Vec<Hypothesis> {
+    hough_hypotheses_with_progress(model, level, level_index, params, &IgnoreProgress)
+}
+
+fn hough_hypotheses_with_progress(
+    model: &Model,
+    level: &TestLevel,
+    level_index: usize,
+    params: &SearchParams,
+    progress: &dyn ProgressSink,
+) -> Vec<Hypothesis> {
     let model_points = subsample(
         &model.features_at_level(level_index).edges.points,
         params.max_model_hough_points,
@@ -570,14 +714,22 @@ pub fn hough_hypotheses(
         .collect();
     let scale_count = scales.len();
     let accumulator_size = accumulator_width as usize * accumulator_height as usize;
+    let completed = AtomicUsize::new(0);
+    let total_rotations = rotations.len().max(1);
 
     let per_rotation: Vec<Vec<Hypothesis>> = rotations
         .par_iter()
         .map(|&theta| {
+            if progress.cancelled() {
+                return Vec::new();
+            }
             let (sin, cos) = theta.sin_cos();
             let mut accumulators = vec![vec![0.0f32; accumulator_size]; scale_count];
             let mut maxima = vec![0.0f32; scale_count];
             for (test_index, test_point) in test_points.iter().enumerate() {
+                if test_index % 256 == 0 && progress.cancelled() {
+                    return Vec::new();
+                }
                 let test_angle = test_angles[test_index];
                 let target = (test_angle - theta).rem_euclid(std::f32::consts::TAU);
                 let center = (target / bucket_width).floor() as i32;
@@ -674,6 +826,11 @@ pub fn hough_hypotheses(
                     }
                 }
             }
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            progress.progress(
+                DetectStage::Search,
+                0.30 + 0.12 * done as f32 / total_rotations as f32,
+            );
             found
         })
         .collect();
@@ -687,6 +844,16 @@ pub fn descriptor_hypotheses(
     levels: &[TestLevel],
     coarse_level: usize,
     params: &SearchParams,
+) -> Vec<Hypothesis> {
+    descriptor_hypotheses_with_progress(model, levels, coarse_level, params, &IgnoreProgress)
+}
+
+fn descriptor_hypotheses_with_progress(
+    model: &Model,
+    levels: &[TestLevel],
+    coarse_level: usize,
+    params: &SearchParams,
+    progress: &dyn ProgressSink,
 ) -> Vec<Hypothesis> {
     if model.features.corners.is_empty() || params.model_corner_cap == 0 {
         return Vec::new();
@@ -704,7 +871,12 @@ pub fn descriptor_hypotheses(
 
     let max_level = coarse_level.min(levels.len().saturating_sub(1));
     for (level, test_level) in levels.iter().enumerate().take(max_level + 1) {
+        if progress.cancelled() {
+            return Vec::new();
+        }
+        let progress_fraction = 0.42 + 0.10 * (level + 1) as f32 / (max_level + 1) as f32;
         if test_level.corners.is_empty() {
+            progress.progress(DetectStage::Search, progress_fraction);
             continue;
         }
         let test_indices = top_corner_indices(&test_level.corners, params.test_corner_cap);
@@ -714,6 +886,7 @@ pub fn descriptor_hypotheses(
             .collect();
         let test_descriptors = describe_corners(&test_corners, &test_level.edges);
         if test_descriptors.is_empty() {
+            progress.progress(DetectStage::Search, progress_fraction);
             continue;
         }
         let rows = model_descriptors.len();
@@ -721,6 +894,9 @@ pub fn descriptor_hypotheses(
         let distances: Vec<Vec<(f32, i32, i32)>> = (0..rows)
             .into_par_iter()
             .map(|row| {
+                if progress.cancelled() {
+                    return Vec::new();
+                }
                 (0..columns)
                     .map(|column| {
                         descriptor_distance(
@@ -731,6 +907,9 @@ pub fn descriptor_hypotheses(
                     .collect()
             })
             .collect();
+        if progress.cancelled() {
+            return Vec::new();
+        }
 
         let mut best_test = vec![(f32::INFINITY, usize::MAX); columns];
         for (row, row_distances) in distances.iter().enumerate() {
@@ -803,6 +982,7 @@ pub fn descriptor_hypotheses(
                 }
             }
         }
+        progress.progress(DetectStage::Search, progress_fraction);
     }
     hypotheses
 }
@@ -858,22 +1038,41 @@ pub fn segment_hypotheses(
     coarse_level: usize,
     params: &SearchParams,
 ) -> Vec<Hypothesis> {
+    segment_hypotheses_with_progress(model, levels, coarse_level, params, &IgnoreProgress)
+}
+
+fn segment_hypotheses_with_progress(
+    model: &Model,
+    levels: &[TestLevel],
+    coarse_level: usize,
+    params: &SearchParams,
+    progress: &dyn ProgressSink,
+) -> Vec<Hypothesis> {
     if model.segment_pairs.is_empty() || model.features.segments.is_empty() {
         return Vec::new();
     }
     let mut hypotheses = Vec::new();
     let max_level = coarse_level.min(levels.len().saturating_sub(1));
     for (level, test_level) in levels.iter().enumerate().take(max_level + 1) {
+        if progress.cancelled() {
+            return Vec::new();
+        }
+        let progress_fraction = 0.52 + 0.06 * (level + 1) as f32 / (max_level + 1) as f32;
         if test_level.segments.len() < 2 {
+            progress.progress(DetectStage::Search, progress_fraction);
             continue;
         }
         let test_pairs =
             segment_pair_invariants(&test_level.segments, params.segment_pair_cap.max(1));
         if test_pairs.is_empty() {
+            progress.progress(DetectStage::Search, progress_fraction);
             continue;
         }
         let factor = (1u32 << level) as f32;
-        for model_pair in &model.segment_pairs {
+        for (model_pair_index, model_pair) in model.segment_pairs.iter().enumerate() {
+            if model_pair_index % 32 == 0 && progress.cancelled() {
+                return Vec::new();
+            }
             let model_first = model.features.segments[model_pair.first];
             let model_second = model.features.segments[model_pair.second];
             for test_pair in &test_pairs {
@@ -908,6 +1107,7 @@ pub fn segment_hypotheses(
                 );
             }
         }
+        progress.progress(DetectStage::Search, progress_fraction);
     }
     hypotheses
 }
@@ -1052,12 +1252,21 @@ fn rank_hypotheses(
     model_points: &[EdgePoint],
     level_index: usize,
     params: &SearchParams,
+    progress: &dyn ProgressSink,
 ) -> Vec<Hypothesis> {
+    if progress.cancelled() {
+        return Vec::new();
+    }
     let factor = (1u32 << level_index) as f64;
     let tau_d = params.score.tau_d / (1u32 << level_index) as f32;
+    let completed = AtomicUsize::new(0);
+    let total = hypotheses.len().max(1);
     let mut scored: Vec<(f32, Hypothesis)> = hypotheses
         .par_iter()
         .map(|hypothesis| {
+            if progress.cancelled() {
+                return (f32::NEG_INFINITY, *hypothesis);
+            }
             let level_pose = Similarity::from_pose(
                 hypothesis.pose.tx / factor,
                 hypothesis.pose.ty / factor,
@@ -1075,6 +1284,11 @@ fn rank_hypotheses(
                 &params.score,
             )
             .score;
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            progress.progress(
+                DetectStage::Verify,
+                0.58 + 0.10 * done as f32 / total as f32,
+            );
             (score, *hypothesis)
         })
         .collect();
@@ -1104,7 +1318,13 @@ fn verify_hypothesis(
     index: usize,
     hypothesis: &Hypothesis,
     params: &SearchParams,
+    progress: &dyn ProgressSink,
+    completed: &AtomicUsize,
+    total: usize,
 ) -> Option<Detection> {
+    if progress.cancelled() {
+        return None;
+    }
     let mut pose = hypothesis.pose;
     for level in (0..=coarse_level).rev() {
         let Some(test_level) = levels.get(level) else {
@@ -1144,6 +1364,9 @@ fn verify_hypothesis(
         );
     }
 
+    if progress.cancelled() {
+        return None;
+    }
     if !pose_in_search_range(&pose, params) {
         return None;
     }
@@ -1175,7 +1398,14 @@ fn verify_hypothesis(
         tau_d: params.score.tau_d,
         score_params: &params.score,
     };
+    progress.progress(
+        DetectStage::Homography,
+        0.68 + 0.29 * completed.load(Ordering::Relaxed) as f32 / total as f32,
+    );
     let outcome = refine_homography(&input, pose, &similarity_score, &params.homography);
+    if progress.cancelled() {
+        return None;
+    }
 
     let (pose, homography, homography_estimated, score) = match outcome.homography {
         Some(homography) => {
@@ -1204,6 +1434,11 @@ fn verify_hypothesis(
         ambiguity: 1.0,
         fallback_reason,
     };
+    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+    progress.progress(
+        DetectStage::Homography,
+        0.68 + 0.29 * done as f32 / total as f32,
+    );
     Some(Detection {
         id: index,
         pose,
@@ -1247,9 +1482,30 @@ pub fn score_at_level(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::geometry::ZeroFrame;
     use crate::gray::{GrayF32, LoadedImage};
     use crate::model::{Model, SearchDefaults, TeachSettings};
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        events: Mutex<Vec<(DetectStage, f32)>>,
+        cancel_after: Option<usize>,
+        polls: AtomicUsize,
+    }
+
+    impl ProgressSink for RecordingProgress {
+        fn progress(&self, stage: DetectStage, fraction: f32) {
+            self.events.lock().unwrap().push((stage, fraction));
+        }
+
+        fn cancelled(&self) -> bool {
+            let polls = self.polls.fetch_add(1, Ordering::Relaxed) + 1;
+            self.cancel_after.is_some_and(|limit| polls > limit)
+        }
+    }
 
     fn point_in_polygon(x: f32, y: f32, polygon: &[[f32; 2]]) -> bool {
         let mut inside = false;
@@ -1495,5 +1751,60 @@ mod tests {
         let params = SearchParams::from(model.search_defaults);
         let result = detect(&model, &scene, &params).expect("detect");
         assert!(result.detections.is_empty());
+    }
+
+    #[test]
+    fn progress_hook_reports_stages_and_preserves_results() {
+        let model = test_model();
+        let pose = Similarity::from_pose(140.0, 120.0, 0.6, 1.2);
+        let scene = render_scene(&model.source.as_ref().unwrap().gray, &[pose], 256, 224);
+        let params = SearchParams::from(model.search_defaults);
+        let sink = RecordingProgress::default();
+
+        let controlled =
+            detect_with_progress(&model, &scene, &params, &sink).expect("controlled detect");
+        let plain = detect(&model, &scene, &params).expect("plain detect");
+        assert_eq!(
+            controlled.detections, plain.detections,
+            "the progress hook must not change results"
+        );
+        assert_eq!(controlled.hypotheses_generated, plain.hypotheses_generated);
+        assert_eq!(controlled.hypotheses_scored, plain.hypotheses_scored);
+
+        let events = sink.events.lock().unwrap();
+        for stage in [
+            DetectStage::Preprocess,
+            DetectStage::Edges,
+            DetectStage::Search,
+            DetectStage::Verify,
+            DetectStage::Homography,
+        ] {
+            assert!(
+                events.iter().any(|(reported, _)| *reported == stage),
+                "missing stage {stage:?}: {events:?}"
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .all(|(_, fraction)| fraction.is_finite() && (0.0..=1.0).contains(fraction)),
+            "fractions outside [0, 1]: {events:?}"
+        );
+    }
+
+    #[test]
+    fn cancellation_aborts_with_a_cancelled_error() {
+        let model = test_model();
+        let scene = GrayF32::filled(256, 224, 0.12);
+        let params = SearchParams::from(model.search_defaults);
+        let sink = RecordingProgress {
+            cancel_after: Some(2),
+            ..RecordingProgress::default()
+        };
+        let result = detect_with_progress(&model, &scene, &params, &sink);
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "expected cancellation, got {result:?}"
+        );
     }
 }

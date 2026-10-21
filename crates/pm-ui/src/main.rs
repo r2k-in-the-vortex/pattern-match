@@ -1,9 +1,13 @@
 //! Pattern Match desktop application.
 //!
 //! M3 adds teach mode: a rotated ROI, zero frame, mask tools with undo/redo,
-//! model save/load, and the trainable model summary.
+//! model save/load, and the trainable model summary.  M7.5 adds still-image run
+//! mode with a separate test image, worker-thread detection, results inspection,
+//! and JSON/CSV/overlay export.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod run;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,10 +18,20 @@ use pm_core::{
     OverlayOptions, RgbaImage, RotatedRect, SearchDefaults, TeachSettings, ZeroFrame,
     extract_features, filter_features, load_image, mask_bounds_for, render_overlay,
 };
+use run::RunState;
 
 const MIN_ROI_SIZE: f32 = 4.0;
-const HANDLE_HIT_RADIUS: f32 = 10.0;
+pub(crate) const HANDLE_HIT_RADIUS: f32 = 10.0;
 const MASK_HISTORY_LIMIT: usize = 64;
+
+/// Top-level application mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Teach a model from the source image.
+    Teach,
+    /// Run the loaded model against a still test image.
+    Run,
+}
 
 fn main() -> eframe::Result {
     let startup_image = std::env::args_os().nth(1).map(PathBuf::from);
@@ -67,7 +81,7 @@ impl Tool {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum RoiDrag {
+pub(crate) enum RoiDrag {
     Create { start: [f32; 2] },
     Move { last: [f32; 2] },
     Resize { anchor: [f32; 2] },
@@ -75,6 +89,8 @@ enum RoiDrag {
 }
 
 struct PatternMatchApp {
+    mode: Mode,
+    run: RunState,
     loaded: Option<LoadedImage>,
     source_available: bool,
     features: Option<FeatureSet>,
@@ -114,6 +130,8 @@ struct PatternMatchApp {
 impl Default for PatternMatchApp {
     fn default() -> Self {
         Self {
+            mode: Mode::Teach,
+            run: RunState::default(),
             loaded: None,
             source_available: false,
             features: None,
@@ -158,8 +176,21 @@ impl PatternMatchApp {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pmodel"))
         {
             self.open_model(ctx, path);
+        } else if self.mode == Mode::Run {
+            self.open_test_image(ctx, path);
         } else {
             self.load(ctx, path);
+        }
+    }
+
+    fn open_test_image(&mut self, ctx: &egui::Context, path: PathBuf) {
+        match self.run.load_image(ctx, path.clone()) {
+            Ok(()) => {
+                self.status = format!("Test image loaded: {}", path.display());
+            }
+            Err(error) => {
+                self.status = error;
+            }
         }
     }
 
@@ -177,6 +208,7 @@ impl PatternMatchApp {
                 self.model_path = None;
                 self.model = None;
                 self.model_dirty = false;
+                self.run.clear_model();
                 self.roi = None;
                 self.zero = None;
                 self.mask_primitives.clear();
@@ -362,6 +394,7 @@ impl PatternMatchApp {
         match Model::build(loaded, &settings) {
             Ok(model) => match model.save(&path) {
                 Ok(()) => {
+                    let defaults = model.search_defaults;
                     self.model_name = model.name.clone();
                     self.status = format!(
                         "Saved {}: {} edges, {} corners, {} segments, {:.1}% masked.",
@@ -374,6 +407,7 @@ impl PatternMatchApp {
                     self.model = Some(model);
                     self.model_path = Some(path);
                     self.model_dirty = false;
+                    self.run.configure_for_model(defaults);
                 }
                 Err(error) => {
                     self.status = format!("Failed to save model: {error}");
@@ -435,7 +469,9 @@ impl PatternMatchApp {
                 }
                 self.model_dirty = false;
                 self.model_path = Some(path.clone());
+                let defaults = model.search_defaults;
                 self.model = Some(model);
+                self.run.configure_for_model(defaults);
                 self.refresh_preview_overlay(ctx);
                 self.status = if has_source {
                     format!("Opened {}.", path.display())
@@ -681,114 +717,14 @@ impl PatternMatchApp {
         response: &egui::Response,
         pointer: Option<[f32; 2]>,
     ) {
-        let Some(point) = pointer else {
-            if response.drag_stopped() {
-                self.roi_drag = None;
-            }
-            return;
-        };
-        let screen = response
-            .interact_pointer_pos()
-            .expect("pointer position exists");
-
-        if response.drag_started() {
-            if let Some(roi) = self.roi {
-                let corners = roi
-                    .corners()
-                    .map(|corner| image_to_screen(corner, rect, scale));
-                if let Some(index) = corners
-                    .iter()
-                    .position(|corner| corner.distance(screen) <= HANDLE_HIT_RADIUS)
-                {
-                    self.roi_drag = Some(RoiDrag::Resize {
-                        anchor: roi.corners()[(index + 2) % 4],
-                    });
-                } else if image_to_screen(rotation_handle_image(&roi), rect, scale).distance(screen)
-                    <= HANDLE_HIT_RADIUS
-                {
-                    self.roi_drag = Some(RoiDrag::Rotate);
-                } else if roi.contains(point[0], point[1]) {
-                    self.roi_drag = Some(RoiDrag::Move { last: point });
-                } else {
-                    self.roi_drag = Some(RoiDrag::Create { start: point });
-                    self.roi = Some(RotatedRect::new(
-                        point[0],
-                        point[1],
-                        MIN_ROI_SIZE,
-                        MIN_ROI_SIZE,
-                        0.0,
-                    ));
-                }
-            } else {
-                self.roi_drag = Some(RoiDrag::Create { start: point });
-                self.roi = Some(RotatedRect::new(
-                    point[0],
-                    point[1],
-                    MIN_ROI_SIZE,
-                    MIN_ROI_SIZE,
-                    0.0,
-                ));
-            }
-        }
-
-        if response.dragged() {
-            let mut changed = true;
-            match self.roi_drag {
-                Some(RoiDrag::Create { start }) => {
-                    let width = (point[0] - start[0]).abs().max(MIN_ROI_SIZE);
-                    let height = (point[1] - start[1]).abs().max(MIN_ROI_SIZE);
-                    self.roi = Some(RotatedRect::new(
-                        (start[0] + point[0]) * 0.5,
-                        (start[1] + point[1]) * 0.5,
-                        width,
-                        height,
-                        0.0,
-                    ));
-                }
-                Some(RoiDrag::Move { last }) => {
-                    if let Some(roi) = &mut self.roi {
-                        roi.cx += point[0] - last[0];
-                        roi.cy += point[1] - last[1];
-                    }
-                    self.roi_drag = Some(RoiDrag::Move { last: point });
-                }
-                Some(RoiDrag::Resize { anchor }) => {
-                    if let Some(roi) = &mut self.roi {
-                        let (sin, cos) = roi.angle.sin_cos();
-                        let u = [cos, sin];
-                        let v = [-sin, cos];
-                        let d = [point[0] - anchor[0], point[1] - anchor[1]];
-                        let du = d[0] * u[0] + d[1] * u[1];
-                        let dv = d[0] * v[0] + d[1] * v[1];
-                        roi.width = du.abs().max(MIN_ROI_SIZE);
-                        roi.height = dv.abs().max(MIN_ROI_SIZE);
-                        roi.cx = anchor[0] + u[0] * du * 0.5 + v[0] * dv * 0.5;
-                        roi.cy = anchor[1] + u[1] * du * 0.5 + v[1] * dv * 0.5;
-                    }
-                }
-                Some(RoiDrag::Rotate) => {
-                    if let Some(roi) = &mut self.roi {
-                        roi.angle = wrap_angle(
-                            (point[1] - roi.cy).atan2(point[0] - roi.cx)
-                                + std::f32::consts::FRAC_PI_2,
-                        );
-                    }
-                }
-                None => changed = false,
-            }
-            if changed {
-                self.mark_teach_changed();
-            }
-        }
-
-        if response.drag_stopped() {
-            if matches!(self.roi_drag, Some(RoiDrag::Create { .. }))
-                && let Some(roi) = self.roi
-                && (roi.width < MIN_ROI_SIZE || roi.height < MIN_ROI_SIZE)
-            {
-                self.roi = None;
-            }
-            self.roi_drag = None;
+        if edit_rotated_rect(
+            rect,
+            scale,
+            response,
+            pointer,
+            &mut self.roi,
+            &mut self.roi_drag,
+        ) {
             self.mark_teach_changed();
         }
     }
@@ -939,50 +875,108 @@ impl eframe::App for PatternMatchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_drop(&ctx);
+        if let Some(status) = self.run.poll(&ctx) {
+            self.status = status;
+        }
 
         let mut open_image_requested = false;
         let mut open_model_requested = false;
         let mut save_model_requested = false;
         let mut re_extract_requested = false;
         let mut overlay_changed = false;
+        let mut open_test_image_requested = false;
+        let mut run_requested = false;
+        let mut cancel_requested = false;
+        let mut export_json_requested = false;
+        let mut export_csv_requested = false;
+        let mut save_overlay_requested = false;
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Pattern Match");
                 ui.separator();
-                if ui.button("Open image…").clicked() {
-                    open_image_requested = true;
-                }
-                if ui
-                    .add_enabled(self.loaded.is_some(), egui::Button::new("Re-extract"))
-                    .clicked()
-                {
-                    re_extract_requested = true;
-                }
+                ui.selectable_value(&mut self.mode, Mode::Teach, "Teach");
+                ui.selectable_value(&mut self.mode, Mode::Run, "Run");
                 ui.separator();
-                if ui.button("Open model…").clicked() {
-                    open_model_requested = true;
+                match self.mode {
+                    Mode::Teach => {
+                        if ui.button("Open image…").clicked() {
+                            open_image_requested = true;
+                        }
+                        if ui
+                            .add_enabled(self.loaded.is_some(), egui::Button::new("Re-extract"))
+                            .clicked()
+                        {
+                            re_extract_requested = true;
+                        }
+                        ui.separator();
+                        if ui.button("Open model…").clicked() {
+                            open_model_requested = true;
+                        }
+                        let can_save = self.loaded.is_some()
+                            && self.roi.is_some()
+                            && self.zero.is_some()
+                            && self.source_available;
+                        if ui
+                            .add_enabled(can_save, egui::Button::new("Save model…"))
+                            .clicked()
+                        {
+                            save_model_requested = true;
+                        }
+                        ui.separator();
+                        let mut layers_changed = false;
+                        layers_changed |=
+                            ui.checkbox(&mut self.overlay.draw_edges, "Edges").changed();
+                        layers_changed |= ui
+                            .checkbox(&mut self.overlay.draw_corners, "Corners")
+                            .changed();
+                        layers_changed |= ui
+                            .checkbox(&mut self.overlay.draw_segments, "Segments")
+                            .changed();
+                        overlay_changed = layers_changed;
+                    }
+                    Mode::Run => {
+                        if ui.button("Open test image…").clicked() {
+                            open_test_image_requested = true;
+                        }
+                        ui.separator();
+                        if self.run.is_running() {
+                            if ui.button("Cancel").clicked() {
+                                cancel_requested = true;
+                            }
+                        } else {
+                            let can_run = self.model.is_some() && self.run.has_image();
+                            if ui.add_enabled(can_run, egui::Button::new("Run")).clicked() {
+                                run_requested = true;
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Open model…").clicked() {
+                            open_model_requested = true;
+                        }
+                        let has_result = self.run.has_result();
+                        if ui
+                            .add_enabled(has_result, egui::Button::new("Export JSON…"))
+                            .clicked()
+                        {
+                            export_json_requested = true;
+                        }
+                        if ui
+                            .add_enabled(has_result, egui::Button::new("Export CSV…"))
+                            .clicked()
+                        {
+                            export_csv_requested = true;
+                        }
+                        if ui
+                            .add_enabled(has_result, egui::Button::new("Save overlay…"))
+                            .clicked()
+                        {
+                            save_overlay_requested = true;
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut self.run.show_detections, "Detections");
+                    }
                 }
-                let can_save = self.loaded.is_some()
-                    && self.roi.is_some()
-                    && self.zero.is_some()
-                    && self.source_available;
-                if ui
-                    .add_enabled(can_save, egui::Button::new("Save model…"))
-                    .clicked()
-                {
-                    save_model_requested = true;
-                }
-                ui.separator();
-                let mut layers_changed = false;
-                layers_changed |= ui.checkbox(&mut self.overlay.draw_edges, "Edges").changed();
-                layers_changed |= ui
-                    .checkbox(&mut self.overlay.draw_corners, "Corners")
-                    .changed();
-                layers_changed |= ui
-                    .checkbox(&mut self.overlay.draw_segments, "Segments")
-                    .changed();
-                overlay_changed = layers_changed;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("pm-core {}", pm_core::VERSION));
                 });
@@ -993,197 +987,225 @@ impl eframe::App for PatternMatchApp {
             .resizable(true)
             .default_size(250.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Image");
-                    if let Some(path) = &self.image_path {
-                        ui.label(path.file_name().map_or_else(
-                            || path.display().to_string(),
-                            |name| name.to_string_lossy().into_owned(),
-                        ));
-                    } else if let Some(loaded) = &self.loaded {
-                        ui.label("Embedded source");
-                        ui.label(format!("{} × {} px", loaded.gray.width, loaded.gray.height));
-                    } else {
-                        ui.label("No image loaded.");
-                    }
-                    if let Some(path) = &self.model_path {
-                        ui.label(format!(
-                            "Model: {}",
-                            path.file_name().map_or_else(
+                egui::ScrollArea::vertical().show(ui, |ui| match self.mode {
+                    Mode::Teach => {
+                        ui.heading("Image");
+                        if let Some(path) = &self.image_path {
+                            ui.label(path.file_name().map_or_else(
                                 || path.display().to_string(),
                                 |name| name.to_string_lossy().into_owned(),
-                            )
-                        ));
+                            ));
+                        } else if let Some(loaded) = &self.loaded {
+                            ui.label("Embedded source");
+                            ui.label(format!("{} × {} px", loaded.gray.width, loaded.gray.height));
+                        } else {
+                            ui.label("No image loaded.");
+                        }
+                        if let Some(path) = &self.model_path {
+                            ui.label(format!(
+                                "Model: {}",
+                                path.file_name().map_or_else(
+                                    || path.display().to_string(),
+                                    |name| name.to_string_lossy().into_owned(),
+                                )
+                            ));
+                        }
+                        ui.separator();
+                        ui.heading("Tools");
+                        let mut tool = self.tool;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(&mut tool, Tool::Select, "Select");
+                            ui.selectable_value(&mut tool, Tool::Roi, "ROI");
+                            ui.selectable_value(&mut tool, Tool::Zero, "Zero");
+                            ui.selectable_value(&mut tool, Tool::PolygonMask, "Polygon");
+                            ui.selectable_value(&mut tool, Tool::BrushMask, "Brush");
+                        });
+                        if tool != self.tool {
+                            self.tool = tool;
+                            self.roi_drag = None;
+                            self.zero_rotating = false;
+                            self.brush_stroke = None;
+                            self.polygon_points.clear();
+                        }
+                        ui.label(self.tool.hint());
+                        ui.separator();
+                        ui.heading("Mask");
+                        self.update_mask_panel(ui);
+                        ui.separator();
+                        ui.heading("Features");
+                        let (edges, chains, corners, segments) = self.preview_counts;
+                        ui.label(format!("Edge points: {edges}"));
+                        ui.label(format!("Chains: {chains}"));
+                        ui.label(format!("Corners: {corners}"));
+                        ui.label(format!("Segments: {segments}"));
+                        ui.separator();
+                        ui.heading("Orientation legend");
+                        draw_orientation_legend(ui);
                     }
-                    ui.separator();
-                    ui.heading("Tools");
-                    let mut tool = self.tool;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(&mut tool, Tool::Select, "Select");
-                        ui.selectable_value(&mut tool, Tool::Roi, "ROI");
-                        ui.selectable_value(&mut tool, Tool::Zero, "Zero");
-                        ui.selectable_value(&mut tool, Tool::PolygonMask, "Polygon");
-                        ui.selectable_value(&mut tool, Tool::BrushMask, "Brush");
-                    });
-                    if tool != self.tool {
-                        self.tool = tool;
-                        self.roi_drag = None;
-                        self.zero_rotating = false;
-                        self.brush_stroke = None;
-                        self.polygon_points.clear();
+                    Mode::Run => {
+                        let has_model = self.model.is_some();
+                        if self.run.left_panel(ui, has_model) {
+                            open_test_image_requested = true;
+                        }
+                        if self.loaded.is_some() {
+                            ui.separator();
+                            if ui.button("Use teach image").clicked()
+                                && let Some(loaded) = self.loaded.clone()
+                            {
+                                self.run.set_image(&ctx, loaded, None);
+                                self.status = "Teach image copied to the test image.".to_owned();
+                            }
+                        }
                     }
-                    ui.label(self.tool.hint());
-                    ui.separator();
-                    ui.heading("Mask");
-                    self.update_mask_panel(ui);
-                    ui.separator();
-                    ui.heading("Features");
-                    let (edges, chains, corners, segments) = self.preview_counts;
-                    ui.label(format!("Edge points: {edges}"));
-                    ui.label(format!("Chains: {chains}"));
-                    ui.label(format!("Corners: {corners}"));
-                    ui.label(format!("Segments: {segments}"));
-                    ui.separator();
-                    ui.heading("Orientation legend");
-                    draw_orientation_legend(ui);
                 });
             });
 
         egui::Panel::right("parameters_panel")
             .resizable(true)
-            .default_size(300.0)
+            .default_size(340.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Teach");
-                    ui.label("ROI");
-                    self.update_roi_fields(ui);
-                    ui.separator();
-                    ui.label("Zero frame");
-                    self.update_zero_fields(ui);
-                    ui.separator();
-                    ui.label("Model");
-                    ui.horizontal(|ui| {
-                        ui.label("Name");
-                        if ui.text_edit_singleline(&mut self.model_name).changed()
-                            && self.model.is_some()
-                        {
-                            self.model_dirty = true;
+                egui::ScrollArea::vertical().show(ui, |ui| match self.mode {
+                    Mode::Teach => {
+                        ui.heading("Teach");
+                        ui.label("ROI");
+                        self.update_roi_fields(ui);
+                        ui.separator();
+                        ui.label("Zero frame");
+                        self.update_zero_fields(ui);
+                        ui.separator();
+                        ui.label("Model");
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            if ui.text_edit_singleline(&mut self.model_name).changed()
+                                && self.model.is_some()
+                            {
+                                self.model_dirty = true;
+                            }
+                        });
+                        if let Some(model) = &self.model {
+                            let (edges, chains, corners, segments, descriptors, pairs) =
+                                model.counts();
+                            ui.label(format!("Edges: {edges}, chains: {chains}"));
+                            ui.label(format!("Corners: {corners}, descriptors: {descriptors}"));
+                            ui.label(format!("Segments: {segments}, pairs: {pairs}"));
+                            ui.label(format!(
+                                "Masked edge weight: {:.1}%",
+                                model.excluded_edge_weight_fraction * 100.0
+                            ));
+                            if self.model_dirty {
+                                ui.colored_label(
+                                    ui.visuals().warn_fg_color,
+                                    "Modified since last save",
+                                );
+                            }
                         }
-                    });
-                    if let Some(model) = &self.model {
-                        let (edges, chains, corners, segments, descriptors, pairs) = model.counts();
-                        ui.label(format!("Edges: {edges}, chains: {chains}"));
-                        ui.label(format!("Corners: {corners}, descriptors: {descriptors}"));
-                        ui.label(format!("Segments: {segments}, pairs: {pairs}"));
-                        ui.label(format!(
-                            "Masked edge weight: {:.1}%",
-                            model.excluded_edge_weight_fraction * 100.0
-                        ));
-                        if self.model_dirty {
-                            ui.colored_label(
-                                ui.visuals().warn_fg_color,
-                                "Modified since last save",
-                            );
-                        }
-                    }
-                    ui.separator();
-                    ui.heading("Parameters");
-                    let mut changed = false;
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.blur_sigma, 0.0..=3.0)
-                                .text("Blur σ"),
-                        )
-                        .changed();
-                    ui.separator();
-                    ui.label("Edges");
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.edge.high_percentile, 0.5..=0.99)
-                                .text("Adaptive percentile"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.edge.high_floor, 0.01..=0.4)
-                                .text("High threshold floor"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.edge.low_ratio, 0.1..=0.9)
-                                .text("Low / high ratio"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.edge.min_chain_length, 1..=20)
-                                .text("Min chain length"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .checkbox(&mut self.params.edge.subpixel, "Subpixel edges")
-                        .changed();
-                    ui.separator();
-                    ui.label("Corners");
-                    changed |= ui
-                        .checkbox(&mut self.params.detect_corners, "Detect corners")
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.corner.quality, 0.001..=0.1)
-                                .logarithmic(true)
-                                .text("Quality"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.corner.min_distance, 1..=20)
-                                .text("Min distance"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.corner.window_sigma, 0.5..=4.0)
-                                .text("Window σ"),
-                        )
-                        .changed();
-                    ui.separator();
-                    ui.label("Segments");
-                    changed |= ui
-                        .checkbox(&mut self.params.fit_segments, "Fit segments")
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.params.segment.min_length, 2.0..=100.0)
-                                .text("Min length"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(
-                                &mut self.params.segment.max_perpendicular_error,
-                                0.1..=3.0,
+                        ui.separator();
+                        ui.heading("Parameters");
+                        let mut changed = false;
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.blur_sigma, 0.0..=3.0)
+                                    .text("Blur σ"),
                             )
-                            .text("Max deviation"),
-                        )
-                        .changed();
-                    if changed {
-                        self.params_dirty = true;
-                        self.params_changed_at = Some(Instant::now());
+                            .changed();
+                        ui.separator();
+                        ui.label("Edges");
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.params.edge.high_percentile,
+                                    0.5..=0.99,
+                                )
+                                .text("Adaptive percentile"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.edge.high_floor, 0.01..=0.4)
+                                    .text("High threshold floor"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.edge.low_ratio, 0.1..=0.9)
+                                    .text("Low / high ratio"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.edge.min_chain_length, 1..=20)
+                                    .text("Min chain length"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.params.edge.subpixel, "Subpixel edges")
+                            .changed();
+                        ui.separator();
+                        ui.label("Corners");
+                        changed |= ui
+                            .checkbox(&mut self.params.detect_corners, "Detect corners")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.corner.quality, 0.001..=0.1)
+                                    .logarithmic(true)
+                                    .text("Quality"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.corner.min_distance, 1..=20)
+                                    .text("Min distance"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.corner.window_sigma, 0.5..=4.0)
+                                    .text("Window σ"),
+                            )
+                            .changed();
+                        ui.separator();
+                        ui.label("Segments");
+                        changed |= ui
+                            .checkbox(&mut self.params.fit_segments, "Fit segments")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.params.segment.min_length, 2.0..=100.0)
+                                    .text("Min length"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.params.segment.max_perpendicular_error,
+                                    0.1..=3.0,
+                                )
+                                .text("Max deviation"),
+                            )
+                            .changed();
+                        if changed {
+                            self.params_dirty = true;
+                            self.params_changed_at = Some(Instant::now());
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.loaded.is_some(),
+                                egui::Button::new("Apply and re-extract"),
+                            )
+                            .clicked()
+                        {
+                            re_extract_requested = true;
+                        }
+                        if self.params_dirty {
+                            ui.colored_label(ui.visuals().warn_fg_color, "Parameters changed");
+                        }
                     }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.loaded.is_some(),
-                            egui::Button::new("Apply and re-extract"),
-                        )
-                        .clicked()
-                    {
-                        re_extract_requested = true;
-                    }
-                    if self.params_dirty {
-                        ui.colored_label(ui.visuals().warn_fg_color, "Parameters changed");
+                    Mode::Run => {
+                        let has_model = self.model.is_some();
+                        let running = self.run.is_running();
+                        self.run.right_panel(ui, has_model, running);
                     }
                 });
             });
@@ -1196,7 +1218,26 @@ impl eframe::App for PatternMatchApp {
                     ui.label(format!("({x:.1}, {y:.1}) px"));
                     ui.separator();
                 }
-                ui.label(format!("features {:.1} ms", self.extraction_ms));
+                match self.mode {
+                    Mode::Teach => {
+                        ui.label(format!("features {:.1} ms", self.extraction_ms));
+                    }
+                    Mode::Run => {
+                        if let Some(stage) = self.run.stage {
+                            ui.label(format!(
+                                "{} {:.0}%",
+                                stage.as_str(),
+                                self.run.fraction * 100.0
+                            ));
+                            ui.separator();
+                        }
+                        if self.run.last_elapsed_ms > 0.0 {
+                            ui.label(format!("run {:.1} ms", self.run.last_elapsed_ms));
+                        } else {
+                            ui.label(format!("{} detection(s)", self.run.detection_count()));
+                        }
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("pm-ui {}", env!("CARGO_PKG_VERSION")));
                 });
@@ -1204,7 +1245,10 @@ impl eframe::App for PatternMatchApp {
         });
 
         let cursor = egui::CentralPanel::default()
-            .show(ui, |ui| self.draw_canvas(ui))
+            .show(ui, |ui| match self.mode {
+                Mode::Teach => self.draw_canvas(ui),
+                Mode::Run => self.run.draw_canvas(ui, self.model.as_ref()),
+            })
             .inner;
         self.cursor_px = cursor;
 
@@ -1235,6 +1279,68 @@ impl eframe::App for PatternMatchApp {
             };
             self.save_model(path);
         }
+        if open_test_image_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tif", "tiff"])
+                .pick_file()
+        {
+            self.open_test_image(&ctx, path);
+        }
+        if run_requested {
+            let outcome = match self.model.as_ref() {
+                Some(model) => self.run.start(&ctx, model),
+                None => Err("Open a model before running.".to_owned()),
+            };
+            match outcome {
+                Ok(()) => self.status = "Detection started.".to_owned(),
+                Err(error) => self.status = error,
+            }
+        }
+        if cancel_requested {
+            self.run.cancel();
+            self.status = "Cancelling detection…".to_owned();
+        }
+
+        let export_stem = self
+            .run
+            .document()
+            .map_or_else(|| "results".to_owned(), |document| document.model.clone());
+        if export_json_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .set_file_name(format!("{export_stem}-results.json"))
+                .save_file()
+        {
+            let path = ensure_extension(path, "json");
+            self.status = match self.run.export_json(&path) {
+                Ok(()) => format!("Wrote {}", path.display()),
+                Err(error) => error,
+            };
+        }
+        if export_csv_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("CSV", &["csv"])
+                .set_file_name(format!("{export_stem}-results.csv"))
+                .save_file()
+        {
+            let path = ensure_extension(path, "csv");
+            self.status = match self.run.export_csv(&path) {
+                Ok(()) => format!("Wrote {}", path.display()),
+                Err(error) => error,
+            };
+        }
+        if save_overlay_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("PNG", &["png"])
+                .set_file_name(format!("{export_stem}-overlay.png"))
+                .save_file()
+        {
+            let path = ensure_extension(path, "png");
+            self.status = match self.run.save_overlay_png(&path) {
+                Ok(()) => format!("Wrote {}", path.display()),
+                Err(error) => error,
+            };
+        }
         let mut live_extract = false;
         if self.params_dirty
             && let Some(changed_at) = self.params_changed_at
@@ -1255,7 +1361,15 @@ impl eframe::App for PatternMatchApp {
     }
 }
 
-fn wrap_angle(angle: f32) -> f32 {
+fn ensure_extension(path: PathBuf, extension: &str) -> PathBuf {
+    if path.extension().is_some() {
+        path
+    } else {
+        path.with_extension(extension)
+    }
+}
+
+pub(crate) fn wrap_angle(angle: f32) -> f32 {
     let wrapped =
         (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
     if wrapped <= -std::f32::consts::PI {
@@ -1265,11 +1379,11 @@ fn wrap_angle(angle: f32) -> f32 {
     }
 }
 
-fn image_to_screen(p: [f32; 2], rect: Rect, scale: f32) -> Pos2 {
+pub(crate) fn image_to_screen(p: [f32; 2], rect: Rect, scale: f32) -> Pos2 {
     rect.min + egui::vec2(p[0] * scale, p[1] * scale)
 }
 
-fn screen_to_image(pos: Pos2, rect: Rect, scale: f32) -> [f32; 2] {
+pub(crate) fn screen_to_image(pos: Pos2, rect: Rect, scale: f32) -> [f32; 2] {
     [(pos.x - rect.left()) / scale, (pos.y - rect.top()) / scale]
 }
 
@@ -1290,7 +1404,17 @@ fn zero_handle_image(zero: &ZeroFrame) -> [f32; 2] {
 }
 
 fn draw_roi(painter: &egui::Painter, rect: Rect, scale: f32, roi: &RotatedRect) {
-    let color = Color32::from_rgb(255, 200, 60);
+    draw_rect_editor(painter, rect, scale, roi, Color32::from_rgb(255, 200, 60));
+}
+
+/// Draw a rotated rectangle with corner and rotation handles.
+pub(crate) fn draw_rect_editor(
+    painter: &egui::Painter,
+    rect: Rect,
+    scale: f32,
+    roi: &RotatedRect,
+    color: Color32,
+) {
     let corners = roi.corners();
     let screen: Vec<Pos2> = corners
         .iter()
@@ -1318,6 +1442,131 @@ fn draw_roi(painter: &egui::Painter, rect: Rect, scale: f32, roi: &RotatedRect) 
     let rotation = image_to_screen(rotation_handle_image(roi), rect, scale);
     painter.line_segment([top_center, rotation], Stroke::new(1.0, color));
     painter.circle_filled(rotation, 4.0, color);
+}
+
+/// Edit a rotated rectangle with drag, resize, and rotation handles at
+/// `MIN_ROI_SIZE` granularity.  Returns whether the geometry changed.
+pub(crate) fn edit_rotated_rect(
+    rect: Rect,
+    scale: f32,
+    response: &egui::Response,
+    pointer: Option<[f32; 2]>,
+    target: &mut Option<RotatedRect>,
+    drag: &mut Option<RoiDrag>,
+) -> bool {
+    let Some(point) = pointer else {
+        if response.drag_stopped() {
+            *drag = None;
+        }
+        return false;
+    };
+    let screen = response
+        .interact_pointer_pos()
+        .expect("pointer position exists");
+    let mut changed = false;
+
+    if response.drag_started() {
+        if let Some(roi) = *target {
+            let corners = roi
+                .corners()
+                .map(|corner| image_to_screen(corner, rect, scale));
+            if let Some(index) = corners
+                .iter()
+                .position(|corner| corner.distance(screen) <= HANDLE_HIT_RADIUS)
+            {
+                *drag = Some(RoiDrag::Resize {
+                    anchor: roi.corners()[(index + 2) % 4],
+                });
+            } else if image_to_screen(rotation_handle_image(&roi), rect, scale).distance(screen)
+                <= HANDLE_HIT_RADIUS
+            {
+                *drag = Some(RoiDrag::Rotate);
+            } else if roi.contains(point[0], point[1]) {
+                *drag = Some(RoiDrag::Move { last: point });
+            } else {
+                *drag = Some(RoiDrag::Create { start: point });
+                *target = Some(RotatedRect::new(
+                    point[0],
+                    point[1],
+                    MIN_ROI_SIZE,
+                    MIN_ROI_SIZE,
+                    0.0,
+                ));
+                changed = true;
+            }
+        } else {
+            *drag = Some(RoiDrag::Create { start: point });
+            *target = Some(RotatedRect::new(
+                point[0],
+                point[1],
+                MIN_ROI_SIZE,
+                MIN_ROI_SIZE,
+                0.0,
+            ));
+            changed = true;
+        }
+    }
+
+    if response.dragged() {
+        match *drag {
+            Some(RoiDrag::Create { start }) => {
+                let width = (point[0] - start[0]).abs().max(MIN_ROI_SIZE);
+                let height = (point[1] - start[1]).abs().max(MIN_ROI_SIZE);
+                *target = Some(RotatedRect::new(
+                    (start[0] + point[0]) * 0.5,
+                    (start[1] + point[1]) * 0.5,
+                    width,
+                    height,
+                    0.0,
+                ));
+                changed = true;
+            }
+            Some(RoiDrag::Move { last }) => {
+                if let Some(roi) = target {
+                    roi.cx += point[0] - last[0];
+                    roi.cy += point[1] - last[1];
+                    changed = true;
+                }
+                *drag = Some(RoiDrag::Move { last: point });
+            }
+            Some(RoiDrag::Resize { anchor }) => {
+                if let Some(roi) = target {
+                    let (sin, cos) = roi.angle.sin_cos();
+                    let u = [cos, sin];
+                    let v = [-sin, cos];
+                    let d = [point[0] - anchor[0], point[1] - anchor[1]];
+                    let du = d[0] * u[0] + d[1] * u[1];
+                    let dv = d[0] * v[0] + d[1] * v[1];
+                    roi.width = du.abs().max(MIN_ROI_SIZE);
+                    roi.height = dv.abs().max(MIN_ROI_SIZE);
+                    roi.cx = anchor[0] + u[0] * du * 0.5 + v[0] * dv * 0.5;
+                    roi.cy = anchor[1] + u[1] * du * 0.5 + v[1] * dv * 0.5;
+                    changed = true;
+                }
+            }
+            Some(RoiDrag::Rotate) => {
+                if let Some(roi) = target {
+                    roi.angle = wrap_angle(
+                        (point[1] - roi.cy).atan2(point[0] - roi.cx) + std::f32::consts::FRAC_PI_2,
+                    );
+                    changed = true;
+                }
+            }
+            None => {}
+        }
+    }
+
+    if response.drag_stopped() {
+        if matches!(*drag, Some(RoiDrag::Create { .. }))
+            && let Some(roi) = *target
+            && (roi.width < MIN_ROI_SIZE || roi.height < MIN_ROI_SIZE)
+        {
+            *target = None;
+            changed = true;
+        }
+        *drag = None;
+    }
+    changed
 }
 
 fn draw_zero(painter: &egui::Painter, rect: Rect, scale: f32, zero: &ZeroFrame) {
@@ -1458,7 +1707,11 @@ fn mask_color(add: bool, alpha: u8) -> Color32 {
     }
 }
 
-fn texture_from_rgba(ctx: &egui::Context, name: &str, image: &RgbaImage) -> egui::TextureHandle {
+pub(crate) fn texture_from_rgba(
+    ctx: &egui::Context,
+    name: &str,
+    image: &RgbaImage,
+) -> egui::TextureHandle {
     let size = [image.width() as usize, image.height() as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
     ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
@@ -1494,8 +1747,10 @@ fn draw_orientation_legend(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn write_test_image() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let (width, height) = (96, 72);
         let mut data = vec![20u8; width * height];
         for y in 14..58 {
@@ -1504,7 +1759,8 @@ mod tests {
             }
         }
         let image = image::GrayImage::from_raw(width as u32, height as u32, data).unwrap();
-        let path = std::env::temp_dir().join(format!("pm-ui-m3-test-{}.png", std::process::id()));
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("pm-ui-test-{}-{id}.png", std::process::id()));
         image.save(&path).unwrap();
         path
     }
@@ -1562,6 +1818,107 @@ mod tests {
         assert_eq!(app.model.as_ref().unwrap().mask.excluded, saved_mask);
         assert!(app.features.is_some());
         assert!(app.overlay_texture.is_some());
+    }
+
+    #[test]
+    fn run_mode_matches_direct_detection_and_exports() {
+        use pm_core::{DETECTION_CSV_HEADER, HypothesisSources, ResultsFile, SearchParams, detect};
+
+        let image_path = write_test_image();
+        let model_path =
+            std::env::temp_dir().join(format!("pm-ui-m75-{}.pmodel", std::process::id()));
+        let ctx = egui::Context::default();
+        let mut app = PatternMatchApp::default();
+        app.load(&ctx, image_path.clone());
+        app.roi = Some(RotatedRect::new(48.0, 36.0, 70.0, 50.0, 0.0));
+        app.zero = Some(ZeroFrame {
+            origin: [48.0, 36.0],
+            angle: 0.0,
+        });
+        app.model_name = "run-test".to_owned();
+        app.save_model(model_path.clone());
+        let model = app.model.clone().expect("model built");
+        assert_eq!(
+            app.run.params,
+            SearchParams::from(model.search_defaults),
+            "run parameters start from the model defaults"
+        );
+
+        // A tiny search range centred on the true pose keeps the unit test
+        // fast while exercising the full worker/result/export path.
+        app.run.params = SearchParams {
+            rotation_min_deg: -10.0,
+            rotation_max_deg: 10.0,
+            rotation_bins: 3,
+            scale_min: 0.96,
+            scale_max: 1.04,
+            scale_bins: 3,
+            max_model_hough_points: 128,
+            max_test_hough_points: 128,
+            hypothesis_cap: 20,
+            max_hypotheses_scored: 4,
+            hypothesis_sources: HypothesisSources::Hough,
+            score_threshold: 0.2,
+            coverage_min: 0.2,
+            ..SearchParams::from(model.search_defaults)
+        };
+        let loaded = app.loaded.clone().expect("teach image");
+        app.run.set_image(&ctx, loaded.clone(), None);
+        app.run.start(&ctx, &model).expect("start run");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while app.run.is_running() {
+            let _ = app.run.poll(&ctx);
+            assert!(Instant::now() < deadline, "run timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let document = app.run.document().expect("run result").clone();
+        assert!(
+            !document.detections.is_empty(),
+            "the taught image should match itself"
+        );
+
+        let mut params = app.run.params;
+        params.search_region = app.run.search_region;
+        let direct = detect(&model, &loaded.gray, &params).expect("direct detect");
+        let expected = ResultsFile::new(
+            model.name.clone(),
+            loaded.gray.width,
+            loaded.gray.height,
+            &params,
+            &direct,
+        );
+        assert_eq!(
+            document.detections, expected.detections,
+            "UI detections must match the library/CLI path"
+        );
+
+        let stem = format!("pm-ui-m75-{}", std::process::id());
+        let json_path = std::env::temp_dir().join(format!("{stem}.json"));
+        let csv_path = std::env::temp_dir().join(format!("{stem}.csv"));
+        let png_path = std::env::temp_dir().join(format!("{stem}.png"));
+        app.run.export_json(&json_path).expect("json export");
+        app.run.export_csv(&csv_path).expect("csv export");
+        app.run.save_overlay_png(&png_path).expect("overlay export");
+
+        let json = std::fs::read_to_string(&json_path).expect("read json");
+        assert_eq!(
+            json,
+            document.to_json().expect("serialize document"),
+            "the exported JSON is the versioned result document"
+        );
+        let parsed = ResultsFile::from_json(&json).expect("parse json");
+        assert_eq!(parsed.model, document.model);
+        assert_eq!(parsed.detections.len(), document.detections.len());
+        let csv = std::fs::read_to_string(&csv_path).expect("read csv");
+        assert!(csv.starts_with(DETECTION_CSV_HEADER));
+        assert_eq!(csv.lines().count(), document.detections.len() + 1);
+        let overlay = image::open(&png_path).expect("open overlay");
+        assert_eq!(overlay.width(), loaded.display.width());
+        assert_eq!(overlay.height(), loaded.display.height());
+
+        for path in [image_path, model_path, json_path, csv_path, png_path] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

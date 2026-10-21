@@ -6,7 +6,8 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M7 complete.** The `pm-cli` harness implements `run`, `batch`,
+**Status: M7.5 complete; M8 (webcam/live + packaging) is planned next.** The
+`pm-cli` harness implements `run`, `batch`,
 `model inspect`, and `bench synthetic` against the same `pm-core` detector used by
 the library, with versioned result JSON, CSV export, annotated overlay PNGs,
 partial parameter overrides, and deterministic seeds. The synthetic benchmark
@@ -20,6 +21,12 @@ save/reload round-trip reproduces them exactly. The Lean core proves D1–D5 and
 R1–R5 with no `sorry`, including DLT uniqueness/degeneracy/normalization and the
 RANSAC probability, bound, success-formula, monotonicity, and iteration
 guarantees; Rust implements Hartley-normalized DLT and seeded RANSAC.
+
+M7.5 adds still-image run mode to the desktop UI: the model stays loaded while a test
+image is opened, detection runs off the UI thread with stage progress and cancellation,
+and each detection is presented both as data (results table, JSON/CSV) and on the
+canvas (transformed ROI outline, zero frame, matched edges). The detector exposes an
+optional progress/cancellation hook; with no hook attached, results are unchanged.
 
 The detector is a hybrid similarity search: pyramid oriented Hough voting,
 corner-descriptor and segment-pair seeding, pose clustering, edge-distance
@@ -939,20 +946,33 @@ is navigable.
 - **Save model**: name, path, embedded-source-image option, and a model summary with
   edge/corner/segment/descriptor counts.
 
-### 11.3 Run mode
+### 11.3 Run mode (still image; M7.5)
 
-- Load test image or switch to live camera.
+Live camera mode is §11.4 and is delivered by M8. M7.5 implements this still-image
+subset, so the UI can test images before webcam support exists.
+
+- Load a test image without unloading the current model. Teach state and run state are
+  separate: the model stays active while the test image is displayed, and the teach
+  image remains available when switching back.
 - Optional search region tool (rotated rectangle) in the test image.
 - Search parameter panel: rotation min/max, scale min/max, max detections, score
   threshold, coverage minimum, polarity on/off, search level (auto/manual),
   hypothesis sources (Hough / descriptors / both), descriptor caps, RANSAC
   confidence/seed.
-- Run/cancel. Progress shows the active stage (preprocess, edges, Hough/descriptor
-  seeding, verify, refine, homography).
-- Results table: id, x, y, angle°, scale, score, confidence, seed source,
-  homography-estimated. Selecting a row highlights it in the canvas and opens a
-  details pane with the full matrix and diagnostics.
-- Export JSON, export CSV, save annotated overlay.
+- Run/cancel on a worker thread (§5.4). Progress shows the active stage (preprocess,
+  edges, Hough/descriptor seeding, verify, refine, homography). Cooperative
+  cancellation requires an optional token/progress hook in `pm-core::detect`; it must
+  not change default results.
+- Results as data: a table with id, x, y, angle°, scale, score, confidence, seed
+  source, and homography-estimated. Selecting a row opens a details pane with the full
+  3×3 matrix and diagnostics. Export JSON (§12.3) and CSV with the same detection
+  values as `pm-cli run` for the same image, parameters, and seed.
+- Results as overlay: every accepted detection is drawn on the canvas with its
+  transformed ROI outline, zero origin and axes, and matched model edges; the selected
+  detection is highlighted. The overlay uses the same homography as the data output,
+  including the similarity fallback.
+- Save an annotated overlay PNG through the same geometry path as
+  `pm-cli run --overlay`.
 
 ### 11.4 Live camera
 
@@ -1171,7 +1191,8 @@ pruning, and parallel reductions. GPU acceleration is explicitly future work.
 | M4: Lean DLT/RANSAC + Rust estimation | Core proofs D1–D5 and R1–R5; Rust normalized DLT, rank checks, RANSAC, iteration logic; golden tests. D6 follows later. | No `sorry` in core modules; exact recovery/degeneracy tests pass; RANSAC probabilities conform. |
 | M5: Hybrid similarity search | Pyramid Hough, corner-descriptor and segment-pair seeding, hypothesis clustering, scoring, ICP/pattern refinement, multi-instance NMS. | Synthetic similarity benchmark meets provisional targets; Hough-only and hybrid recall both reported. |
 | M6: Homography refinement | Correspondence assembly, RANSAC H, robust LM, validation/fallback, confidence/diagnostics. | Tilt benchmark meets targets; fallback behavior validated; JSON schema complete. |
-| M7: CLI and benchmark harness | `run`/`batch`/`inspect`/`bench`, JSON/CSV, overlay export, deterministic seeds. | CLI reproduces library/UI results; batch outputs valid files. |
+| M7: CLI and benchmark harness | `run`/`batch`/`inspect`/`bench`, JSON/CSV, overlay export, deterministic seeds. | CLI reproduces library results; batch outputs valid files. |
+| M7.5: Still-image UI run mode | Separate run state so a model stays loaded while a test image is opened; search region and parameter panel; worker-thread Run/Cancel with progress; results table/details; JSON/CSV export; canvas overlay of each detection's transformed ROI, zero frame, and matched edges; annotated PNG export. | Model + still test image run entirely from the UI; every detection is visible on the canvas and selectable; exported JSON/CSV detection values and overlay PNG match `pm-cli run` for the same image, parameters, and seed. |
 | M8: Webcam/live + packaging | Webcam source, freeze-frame teaching, live run, Windows release build. | Webcam frame can be taught and detected live; UI remains responsive; packaged exe launches. |
 | M9: Hardening and docs | Parameter tuning, error handling, file validation, performance profiling, user guide. | CI green; acceptance report; known limitations documented. |
 
@@ -1180,7 +1201,10 @@ Feature and UI work (M2/M3) can proceed in parallel with proof work because it d
 depend on the formalization. The search stage (M5) depends on geometry, scoring, and
 models; homography refinement (M6) depends on DLT/RANSAC. D6 is scheduled as a proof
 follow-on after M6; it does not block the detector because the Rust SVD path is tested
-numerically.
+numerically. M7.5 is the still-image UI prerequisite for M8's live mode: it reuses the
+`pm-core` detector and result serialization, adding only the optional cancellation and
+progress hook to `detect`; M8 layers camera capture and frame dropping on top of the
+same run state.
 
 ---
 

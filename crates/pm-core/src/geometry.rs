@@ -203,6 +203,16 @@ impl Homography {
         affine_normalize(self.act_homogeneous(homogenize(p)))
     }
 
+    /// Affine action on an array point, returning `None` at infinity (G2).
+    ///
+    /// Convenience wrapper used by UI overlays, which store points as
+    /// `[f32; 2]`.
+    #[must_use]
+    pub fn try_act_array(&self, p: [f32; 2]) -> Option<[f32; 2]> {
+        self.try_act_point(Vector2::new(f64::from(p[0]), f64::from(p[1])))
+            .map(|q| [q.x as f32, q.y as f32])
+    }
+
     /// Matrix product: `self` applied after `rhs` (G1).
     #[must_use]
     pub fn compose(&self, rhs: &Self) -> Self {
