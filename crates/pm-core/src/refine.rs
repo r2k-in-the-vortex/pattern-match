@@ -2,9 +2,12 @@
 //!
 //! M4 provides the shared RANSAC machinery: deterministic sampling from a
 //! seeded PRNG, degeneracy rejection, adaptive iteration counts, inlier
-//! counting by symmetric transfer error, and refitting on the inlier set.  The
-//! similarity ICP and robust Levenberg–Marquardt stages of README §9.6–§9.7
-//! build on this in M5–M6.
+//! counting by symmetric transfer error, and refitting on the inlier set.
+//!
+//! M5 adds the normal-directed correspondence search and weighted similarity
+//! Procrustes fit of README §9.6, with a score-based pattern-search fallback
+//! and a fine final polish.  Robust Levenberg–Marquardt homography refinement
+//! (README §9.7) arrives with M6.
 //!
 //! Theorem links:
 //!
@@ -22,7 +25,7 @@
 
 use nalgebra::Vector2;
 
-use crate::geometry::{Homography, normalized_dlt};
+use crate::geometry::{Homography, Similarity, normalized_dlt};
 
 /// Minimal sample size for a homography (four correspondences).
 pub const HOMOGRAPHY_SAMPLE_SIZE: usize = 4;
@@ -271,6 +274,399 @@ pub fn ransac_homography(
     }
 }
 
+/// Parameters for similarity refinement (README §9.6).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SimilarityRefineParams {
+    /// Normal-directed correspondence search radius, in level pixels.
+    pub search_radius: f32,
+    /// ICP iterations per level.
+    pub iterations: usize,
+    /// Minimum reliable correspondences for a Procrustes fit.
+    pub min_correspondences: usize,
+    /// Robust weight scale for correspondence residuals.
+    pub robust_sigma: f32,
+    /// Minimum gradient response for a correspondence.
+    pub response_min: f32,
+    /// Use the broad 5⁴ multi-start grid when ICP fails.  The caller enables
+    /// this only at the coarsest level.
+    pub broad_fallback: bool,
+}
+
+impl Default for SimilarityRefineParams {
+    fn default() -> Self {
+        Self {
+            search_radius: 3.5,
+            iterations: 4,
+            min_correspondences: 8,
+            robust_sigma: 1.5,
+            response_min: 0.01,
+            broad_fallback: true,
+        }
+    }
+}
+
+/// Result of one level's similarity refinement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SimilarityRefineResult {
+    /// Refined level-local pose.
+    pub pose: Similarity,
+    /// Number of reliable correspondences used by the final fit.
+    pub correspondences: usize,
+}
+
+/// Refine a similarity pose at one level (README §9.6).
+///
+/// Correspondences are searched along the transformed normal and fitted with a
+/// weighted similarity Procrustes solve.  When too few correspondences survive,
+/// the caller's pattern-search fallback is used.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn refine_similarity_level(
+    model_points: &[crate::feature::EdgePoint],
+    width: usize,
+    height: usize,
+    gradient: &crate::gradient::GradientField,
+    distance: &crate::edge::DistanceField,
+    pose: Similarity,
+    tau_d: f32,
+    score_params: &crate::score::ScoreParams,
+    params: &SimilarityRefineParams,
+) -> SimilarityRefineResult {
+    let mut current = pose;
+    let mut correspondences = 0usize;
+    for _ in 0..params.iterations {
+        let Some((next, count)) = icp_step(model_points, width, height, gradient, &current, params)
+        else {
+            break;
+        };
+        if !next.is_finite() || next.scale <= 0.02 {
+            break;
+        }
+        current = next;
+        correspondences = count;
+    }
+
+    if correspondences < params.min_correspondences {
+        let polished = pattern_search_similarity(
+            model_points,
+            width,
+            height,
+            gradient,
+            distance,
+            &current,
+            tau_d,
+            score_params,
+            &PatternSearchParams {
+                iterations: 10,
+                translation_step: 2.0,
+                angle_step: 0.03,
+                scale_step: 0.05,
+                grid: params.broad_fallback,
+                grid_radius: 1,
+                max_sweeps: 4,
+            },
+        );
+        current = polished;
+    } else {
+        current = pattern_search_similarity(
+            model_points,
+            width,
+            height,
+            gradient,
+            distance,
+            &current,
+            tau_d,
+            score_params,
+            &PatternSearchParams {
+                iterations: 3,
+                translation_step: 0.25,
+                angle_step: 0.002,
+                scale_step: 0.002,
+                grid: false,
+                grid_radius: 1,
+                max_sweeps: 3,
+            },
+        );
+    }
+
+    SimilarityRefineResult {
+        pose: current,
+        correspondences,
+    }
+}
+
+fn icp_step(
+    model_points: &[crate::feature::EdgePoint],
+    width: usize,
+    height: usize,
+    gradient: &crate::gradient::GradientField,
+    pose: &Similarity,
+    params: &SimilarityRefineParams,
+) -> Option<(Similarity, usize)> {
+    if model_points.is_empty() || width == 0 || height == 0 {
+        return None;
+    }
+    let rotation = Similarity::rotation(pose.theta);
+    let max_x = (width - 1) as f64;
+    let max_y = (height - 1) as f64;
+    let radius = f64::from(params.search_radius.max(0.5));
+    let step = 0.5f32;
+    let steps = (radius / f64::from(step)).ceil() as i32;
+
+    let mut samples = Vec::new();
+    for point in model_points {
+        let p = Vector2::new(f64::from(point.x), f64::from(point.y));
+        let q = pose.transform_point(p);
+        if q.x < 0.0 || q.y < 0.0 || q.x > max_x || q.y > max_y {
+            continue;
+        }
+        let normal = rotation * Vector2::new(f64::from(point.nx), f64::from(point.ny));
+        let response_at = |offset: f32| {
+            let x = (q.x + f64::from(offset) * normal.x) as f32;
+            let y = (q.y + f64::from(offset) * normal.y) as f32;
+            let (gx, gy) = gradient.sample(x, y);
+            let magnitude = f64::from(gx.hypot(gy));
+            if magnitude <= 1e-9 {
+                return 0.0f64;
+            }
+            let dot = (normal.x * f64::from(gx) + normal.y * f64::from(gy)) / magnitude;
+            let agreement = (dot * f64::from(point.sign)).max(0.0);
+            magnitude * agreement * agreement
+        };
+
+        let mut best_offset = 0.0f32;
+        let mut best_response = 0.0f64;
+        for index in -steps..=steps {
+            let offset = index as f32 * step;
+            let response = response_at(offset);
+            if response > best_response {
+                best_response = response;
+                best_offset = offset;
+            }
+        }
+        if best_response < f64::from(params.response_min) {
+            continue;
+        }
+        let minus = response_at(best_offset - step);
+        let center = response_at(best_offset);
+        let plus = response_at(best_offset + step);
+        let denominator = minus - 2.0 * center + plus;
+        let delta = if denominator.abs() > 1e-12 {
+            let value = 0.5 * (minus - plus) / denominator;
+            value.clamp(-0.5, 0.5) as f32
+        } else {
+            0.0
+        };
+        let offset = best_offset + delta * step;
+        let correspondence = q + f64::from(offset) * normal;
+        let robust =
+            1.0 / (1.0 + (f64::from(offset) / f64::from(params.robust_sigma.max(0.1))).powi(2));
+        let weight = f64::from(point.weight.max(0.0)) * best_response * robust;
+        if weight > 0.0 {
+            samples.push((p, correspondence, weight));
+        }
+    }
+
+    if samples.len() < params.min_correspondences {
+        return None;
+    }
+    let mut weight_sum = 0.0;
+    let mut mean_p = Vector2::new(0.0, 0.0);
+    let mut mean_q = Vector2::new(0.0, 0.0);
+    for (p, q, weight) in &samples {
+        weight_sum += weight;
+        mean_p += *p * *weight;
+        mean_q += *q * *weight;
+    }
+    if weight_sum <= 1e-12 {
+        return None;
+    }
+    mean_p /= weight_sum;
+    mean_q /= weight_sum;
+
+    let mut dot: f64 = 0.0;
+    let mut cross: f64 = 0.0;
+    let mut norm: f64 = 0.0;
+    for (p, q, weight) in &samples {
+        let dp = p - mean_p;
+        let dq = q - mean_q;
+        dot += weight * (dp.x * dq.x + dp.y * dq.y);
+        cross += weight * (dp.x * dq.y - dp.y * dq.x);
+        norm += weight * dp.dot(&dp);
+    }
+    if norm <= 1e-12 {
+        return None;
+    }
+    let scale = dot.hypot(cross) / norm;
+    if !scale.is_finite() || scale <= 1e-4 {
+        return None;
+    }
+    let theta = cross.atan2(dot);
+    let rotated = Similarity::rotation(theta) * mean_p * scale;
+    let translated = mean_q - rotated;
+    Some((
+        Similarity::from_pose(translated.x, translated.y, theta, scale),
+        samples.len(),
+    ))
+}
+
+/// Pattern-search parameters for the score-based fallback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PatternSearchParams {
+    /// Coordinate-descent sweeps.
+    pub iterations: usize,
+    /// Initial translation step in level pixels.
+    pub translation_step: f32,
+    /// Initial rotation step in radians.
+    pub angle_step: f32,
+    /// Initial relative scale step.
+    pub scale_step: f32,
+    /// Whether to seed coordinate descent with a parameter grid.
+    pub grid: bool,
+    /// Grid radius in steps (1 gives 3⁴, 2 gives 5⁴ candidates).
+    pub grid_radius: i32,
+    /// Maximum coordinate-descent sweeps per iteration.
+    pub max_sweeps: usize,
+}
+
+impl Default for PatternSearchParams {
+    fn default() -> Self {
+        Self {
+            iterations: 12,
+            translation_step: 1.0,
+            angle_step: 0.0175,
+            scale_step: 0.02,
+            grid: false,
+            grid_radius: 2,
+            max_sweeps: 8,
+        }
+    }
+}
+
+/// Maximize the edge score by coordinate descent around `pose` (README §9.6).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn pattern_search_similarity(
+    model_points: &[crate::feature::EdgePoint],
+    width: usize,
+    height: usize,
+    gradient: &crate::gradient::GradientField,
+    distance: &crate::edge::DistanceField,
+    pose: &Similarity,
+    tau_d: f32,
+    score_params: &crate::score::ScoreParams,
+    params: &PatternSearchParams,
+) -> Similarity {
+    let mut best = *pose;
+    let mut best_score = crate::score::score_similarity(
+        model_points,
+        width,
+        height,
+        gradient,
+        distance,
+        &best,
+        tau_d,
+        score_params,
+    )
+    .score;
+
+    if params.grid {
+        // A multi-start grid avoids the local maximum formed by a single
+        // strong edge direction (the vertical-edge basin in a rectangle, for
+        // example), which pure coordinate descent can enter and never leave.
+        for dtheta in (-params.grid_radius..=params.grid_radius).map(|step| step as f32) {
+            for dscale in (-params.grid_radius..=params.grid_radius).map(|step| step as f32) {
+                for dy in (-params.grid_radius..=params.grid_radius).map(|step| step as f32) {
+                    for dx in (-params.grid_radius..=params.grid_radius).map(|step| step as f32) {
+                        if dtheta == 0.0 && dscale == 0.0 && dy == 0.0 && dx == 0.0 {
+                            continue;
+                        }
+                        let candidate = Similarity::from_pose(
+                            pose.tx + f64::from(dx * params.translation_step),
+                            pose.ty + f64::from(dy * params.translation_step),
+                            pose.theta + f64::from(dtheta * params.angle_step),
+                            pose.scale * (1.0 + f64::from(dscale * params.scale_step)),
+                        );
+                        if candidate.scale <= 0.02 {
+                            continue;
+                        }
+                        let score = crate::score::score_similarity(
+                            model_points,
+                            width,
+                            height,
+                            gradient,
+                            distance,
+                            &candidate,
+                            tau_d,
+                            score_params,
+                        )
+                        .score;
+                        if score > best_score + 1e-6 {
+                            best = candidate;
+                            best_score = score;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut steps = [
+        params.translation_step,
+        params.translation_step,
+        params.angle_step,
+        params.scale_step,
+    ];
+    for _ in 0..params.iterations {
+        let mut improved = true;
+        let mut sweeps = 0;
+        while improved && sweeps < params.max_sweeps {
+            sweeps += 1;
+            improved = false;
+            for (axis, step) in steps.iter().enumerate() {
+                for direction in [-1.0f32, 1.0] {
+                    let delta = direction * *step;
+                    let candidate = perturb(&best, axis, delta);
+                    if !candidate.is_finite() || candidate.scale <= 0.02 {
+                        continue;
+                    }
+                    let score = crate::score::score_similarity(
+                        model_points,
+                        width,
+                        height,
+                        gradient,
+                        distance,
+                        &candidate,
+                        tau_d,
+                        score_params,
+                    )
+                    .score;
+                    if score > best_score + 1e-6 {
+                        best = candidate;
+                        best_score = score;
+                        improved = true;
+                    }
+                }
+            }
+        }
+        for step in &mut steps {
+            *step *= 0.6;
+        }
+    }
+    best
+}
+
+fn perturb(pose: &Similarity, axis: usize, delta: f32) -> Similarity {
+    let mut next = *pose;
+    match axis {
+        0 => next.tx += f64::from(delta),
+        1 => next.ty += f64::from(delta),
+        2 => next.theta += f64::from(delta),
+        _ => next.scale *= 1.0 + f64::from(delta),
+    }
+    next
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +840,155 @@ mod tests {
         assert!(result.homography.is_none());
         assert!(result.iterations <= params.max_iterations);
         assert!(result.inliers.is_empty());
+    }
+
+    fn rectangle_scene() -> (
+        Vec<crate::feature::EdgePoint>,
+        crate::gradient::GradientField,
+        crate::edge::DistanceField,
+    ) {
+        use crate::feature::{EdgePoint, EdgeSet};
+        let width = 100;
+        let height = 80;
+        let (x0, x1, y0, y1) = (20, 80, 20, 60);
+        let mut gx = vec![0.0f32; width * height];
+        let mut gy = vec![0.0f32; width * height];
+        let mut magnitude = vec![0.0f32; width * height];
+        let mut edges = Vec::new();
+        let mut points = Vec::new();
+        let mut add = |x: f32, y: f32, nx: f32, ny: f32, sign: i8| {
+            let strength = 0.3;
+            // A blurred step produces a gradient band of a few pixels, not a
+            // single-pixel spike.  Widening the test band matters for the
+            // smoothness of the score landscape.
+            for offset in -2i32..=2 {
+                let sx = x + nx * offset as f32;
+                let sy = y + ny * offset as f32;
+                if sx < 0.0 || sy < 0.0 {
+                    continue;
+                }
+                let (ix, iy) = (sx.round() as usize, sy.round() as usize);
+                if ix >= width || iy >= height {
+                    continue;
+                }
+                let weight = (-0.5 * (offset as f32 / 1.1).powi(2)).exp();
+                let index = iy * width + ix;
+                let value = strength * weight;
+                if value > magnitude[index] {
+                    magnitude[index] = value;
+                    gx[index] = nx * value * sign as f32;
+                    gy[index] = ny * value * sign as f32;
+                }
+            }
+            edges.push(EdgePoint {
+                x,
+                y,
+                nx,
+                ny,
+                magnitude: strength,
+                sign,
+                chain_id: 0,
+                weight: 1.0,
+            });
+            points.push(EdgePoint {
+                x,
+                y,
+                nx,
+                ny,
+                magnitude: 1.0,
+                sign,
+                chain_id: 0,
+                weight: 1.0,
+            });
+        };
+        for x in (x0 + 1..x1).step_by(3) {
+            add(x as f32, y0 as f32, 0.0, 1.0, 1);
+            add(x as f32, y1 as f32, 0.0, 1.0, -1);
+        }
+        for y in (y0 + 1..y1).step_by(3) {
+            add(x0 as f32, y as f32, 1.0, 0.0, 1);
+            add(x1 as f32, y as f32, 1.0, 0.0, -1);
+        }
+        let gradient = crate::gradient::GradientField {
+            width,
+            height,
+            gx,
+            gy,
+            magnitude,
+        };
+        let edge_set = EdgeSet {
+            points: edges,
+            chains: Vec::new(),
+        };
+        let distance = crate::edge::DistanceField::from_edges(&edge_set, width, height);
+        let model_points = points.into_iter().filter(|_| true).collect::<Vec<_>>();
+        (model_points, gradient, distance)
+    }
+
+    #[test]
+    fn icp_refines_a_nearby_similarity() {
+        let (points, gradient, distance) = rectangle_scene();
+        let pose = Similarity::from_pose(1.0, -0.8, 0.03, 1.03);
+        let result = refine_similarity_level(
+            &points,
+            100,
+            80,
+            &gradient,
+            &distance,
+            pose,
+            2.5,
+            &crate::score::ScoreParams::default(),
+            &SimilarityRefineParams::default(),
+        );
+        assert!(
+            result.correspondences >= 8,
+            "correspondences {}",
+            result.correspondences
+        );
+        assert!(result.pose.tx.abs() < 0.35, "tx {}", result.pose.tx);
+        assert!(result.pose.ty.abs() < 0.35, "ty {}", result.pose.ty);
+        assert!(
+            result.pose.theta.abs() < 0.01,
+            "theta {}",
+            result.pose.theta
+        );
+        assert!(
+            (result.pose.scale - 1.0).abs() < 0.02,
+            "scale {}",
+            result.pose.scale
+        );
+    }
+
+    #[test]
+    fn pattern_search_recovers_from_a_coarse_seed() {
+        let (points, gradient, distance) = rectangle_scene();
+        let pose = Similarity::from_pose(1.5, -1.2, 0.05, 1.05);
+        let refined = pattern_search_similarity(
+            &points,
+            100,
+            80,
+            &gradient,
+            &distance,
+            &pose,
+            2.5,
+            &crate::score::ScoreParams::default(),
+            &PatternSearchParams {
+                grid: true,
+                ..PatternSearchParams::default()
+            },
+        );
+        let score = crate::score::score_similarity(
+            &points,
+            100,
+            80,
+            &gradient,
+            &distance,
+            &refined,
+            2.5,
+            &crate::score::ScoreParams::default(),
+        )
+        .score;
+        assert!(score > 0.85, "score {score}, pose {refined:?}");
     }
 
     #[test]

@@ -41,7 +41,16 @@ pub use model::{HypothesisSources, Model, SearchDefaults, TeachSettings, mask_bo
 pub use overlay::{OverlayOptions, render_overlay};
 pub use pyramid::Pyramid;
 pub use refine::{
-    RansacParams, RansacResult, ransac_homography, required_iterations, required_iterations_from_q,
+    RansacParams, RansacResult, SimilarityRefineParams, ransac_homography, refine_similarity_level,
+    required_iterations, required_iterations_from_q,
+};
+pub use score::{
+    Detection, DetectionDiagnostics, NmsParams, ScoreParams, SeedSource, confidence_from,
+    non_maximum_suppression,
+};
+pub use search::{
+    DetectionResult, Hypothesis, SearchParams, SearchTimings, TestLevel, TestPyramid, detect,
+    hough_hypotheses,
 };
 
 /// Version of the `pm-core` crate.

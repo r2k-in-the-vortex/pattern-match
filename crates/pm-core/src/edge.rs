@@ -367,6 +367,151 @@ fn degree(pixel: (usize, usize), pixel_set: &HashSet<(usize, usize)>) -> usize {
         .count()
 }
 
+/// Exact Euclidean distance to the nearest accepted edge pixel.
+///
+/// The field is seeded at the pixel containing each subpixel edge point and is
+/// computed with the Felzenszwalb–Huttenlocher squared-distance transform,
+/// followed by a square root.  Sampling is bilinear, so scoring can ask for the
+/// distance at any subpixel model-point projection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DistanceField {
+    /// Image width.
+    pub width: usize,
+    /// Image height.
+    pub height: usize,
+    /// Distance in pixels, row-major.
+    pub distances: Vec<f32>,
+}
+
+impl DistanceField {
+    /// Build the distance field from the pixels containing edge points.
+    #[must_use]
+    pub fn from_edges(edges: &EdgeSet, width: usize, height: usize) -> Self {
+        const LARGE: f32 = 1.0e12;
+        if width == 0 || height == 0 {
+            return Self {
+                width,
+                height,
+                distances: Vec::new(),
+            };
+        }
+        let mut squared = vec![LARGE; width * height];
+        for point in &edges.points {
+            if !point.x.is_finite() || !point.y.is_finite() {
+                continue;
+            }
+            let x = point.x.round();
+            let y = point.y.round();
+            if x < 0.0 || y < 0.0 {
+                continue;
+            }
+            let (x, y) = (x as usize, y as usize);
+            if x < width && y < height {
+                squared[y * width + x] = 0.0;
+            }
+        }
+
+        let longest = width.max(height);
+        let mut buffer = vec![0.0f32; longest];
+        let mut sites = vec![0usize; longest];
+        let mut bounds = vec![0.0f32; longest + 1];
+
+        // Transform each column, then each row.
+        for x in 0..width {
+            for y in 0..height {
+                buffer[y] = squared[y * width + x];
+            }
+            edt_1d(
+                &mut buffer[..height],
+                &mut sites[..height],
+                &mut bounds[..=height],
+            );
+            for y in 0..height {
+                squared[y * width + x] = buffer[y];
+            }
+        }
+        for y in 0..height {
+            buffer[..width].copy_from_slice(&squared[y * width..(y + 1) * width]);
+            edt_1d(
+                &mut buffer[..width],
+                &mut sites[..width],
+                &mut bounds[..=width],
+            );
+            squared[y * width..(y + 1) * width].copy_from_slice(&buffer[..width]);
+        }
+
+        let distances = squared.into_iter().map(f32::sqrt).collect();
+        Self {
+            width,
+            height,
+            distances,
+        }
+    }
+
+    /// Nearest-pixel distance, or `f32::INFINITY` outside the image.
+    #[must_use]
+    pub fn at(&self, x: usize, y: usize) -> f32 {
+        if x < self.width && y < self.height {
+            self.distances[y * self.width + x]
+        } else {
+            f32::INFINITY
+        }
+    }
+
+    /// Bilinearly sampled distance, clamped at the image border.
+    #[must_use]
+    pub fn sample(&self, x: f32, y: f32) -> f32 {
+        if self.width == 0 || self.height == 0 || !x.is_finite() || !y.is_finite() {
+            return f32::INFINITY;
+        }
+        let x = x.clamp(0.0, (self.width - 1) as f32);
+        let y = y.clamp(0.0, (self.height - 1) as f32);
+        let x0 = x.floor() as usize;
+        let y0 = y.floor() as usize;
+        let x1 = (x0 + 1).min(self.width - 1);
+        let y1 = (y0 + 1).min(self.height - 1);
+        let fx = x - x0 as f32;
+        let fy = y - y0 as f32;
+        let value = |ix: usize, iy: usize| self.distances[iy * self.width + ix];
+        let top = value(x0, y0) + (value(x1, y0) - value(x0, y0)) * fx;
+        let bottom = value(x0, y1) + (value(x1, y1) - value(x0, y1)) * fx;
+        top + (bottom - top) * fy
+    }
+}
+
+/// One-dimensional squared Euclidean distance transform.
+fn edt_1d(f: &mut [f32], v: &mut [usize], z: &mut [f32]) {
+    let n = f.len();
+    if n == 0 {
+        return;
+    }
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+    for q in 1..n {
+        let qf = q as f32;
+        let mut s =
+            ((f[q] + qf * qf) - (f[v[k]] + (v[k] * v[k]) as f32)) / (2.0 * (qf - v[k] as f32));
+        while s <= z[k] {
+            k -= 1;
+            s = ((f[q] + qf * qf) - (f[v[k]] + (v[k] * v[k]) as f32)) / (2.0 * (qf - v[k] as f32));
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f32::INFINITY;
+    }
+    k = 0;
+    for q in 0..n {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let dq = q as f32 - v[k] as f32;
+        f[q] = dq * dq + f[v[k]];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +646,42 @@ mod tests {
         let (low, high) = adaptive_thresholds(&gradient, &params);
         assert!((high - params.high_floor).abs() < 1e-6);
         assert!((low - params.high_floor * params.low_ratio).abs() < 1e-6);
+    }
+
+    fn single_edge_point(x: f32, y: f32) -> EdgeSet {
+        EdgeSet {
+            points: vec![crate::feature::EdgePoint {
+                x,
+                y,
+                nx: 1.0,
+                ny: 0.0,
+                magnitude: 1.0,
+                sign: 1,
+                chain_id: 0,
+                weight: 1.0,
+            }],
+            chains: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn distance_field_is_exact_for_axis_aligned_points() {
+        let edges = single_edge_point(10.0, 10.0);
+        let field = DistanceField::from_edges(&edges, 24, 20);
+        assert!(field.at(10, 10).abs() < 1e-5);
+        assert!((field.at(14, 10) - 4.0).abs() < 1e-4);
+        assert!((field.at(10, 15) - 5.0).abs() < 1e-4);
+        assert!((field.at(13, 14) - 5.0).abs() < 1e-4);
+        assert!((field.sample(10.5, 10.0) - 0.5).abs() < 1e-4);
+        assert!((field.sample(12.0, 13.0) - 2.0f32.hypot(3.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn distance_field_handles_multiple_seeds() {
+        let mut edges = single_edge_point(4.0, 4.0);
+        edges.points.extend(single_edge_point(12.0, 12.0).points);
+        let field = DistanceField::from_edges(&edges, 20, 20);
+        assert!((field.at(8, 8) - 4.0f32.hypot(4.0)).abs() < 1e-4);
+        assert!((field.at(11, 11) - std::f32::consts::SQRT_2).abs() < 1e-4);
     }
 }

@@ -6,20 +6,26 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M4 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
+**Status: M5 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
 polygon and brush masks with undo/redo, live feature preview, and `.pmodel`
 save/load. Models store model-frame features, three-scale corner descriptors,
 segment-pair invariants, mask primitives, and a derived mask raster; a
-save/reload round-trip reproduces them exactly. The Lean core now proves
-D1–D5 and R1–R5 with no `sorry`: DLT row exactness, the 8×9 rank/kernel count,
-general-position uniqueness and invertibility, collinear-source degeneracy, and
-Hartley-normalization equivalence; the all-inlier sampling probability, its
-conservative bound, the `N`-iteration success formula, monotonicity, and the
-required-iteration guarantee. Rust provides Hartley-normalized DLT with
-degeneracy rejection and seeded RANSAC with adaptive iteration counts, and the
-golden-vector test covers both. D6 (noisy least-squares optimality) remains the
-documented follow-on. This document is the implementation plan and the record
-of decisions made.
+save/reload round-trip reproduces them exactly. The Lean core proves D1–D5 and
+R1–R5 with no `sorry`, including DLT uniqueness/degeneracy/normalization and the
+RANSAC probability, bound, success-formula, monotonicity, and iteration
+guarantees; Rust implements Hartley-normalized DLT and seeded RANSAC.
+
+The M5 detector is a hybrid similarity search: pyramid oriented Hough voting,
+corner-descriptor and segment-pair seeding, pose clustering, edge-distance
+scoring, coarse-to-fine ICP with a score-based pattern-search fallback, and
+multi-instance NMS. Every detection currently reports the similarity embedding
+(`homography_estimated = false`); perspective evidence arrives in M6. The
+deterministic synthetic similarity benchmark reports 100% recall on clean
+16/16 scenes with worst errors 0.08 px, 0.15°, and 0.27%; 100% at 30% occlusion
+and on 50%-contrast scenes; no clutter-only false detections; and matching
+Hough-only/hybrid recall in every reported scenario. D6
+(noisy least-squares optimality) remains the documented formal follow-on. This
+document is the implementation plan and the record of decisions made.
 
 ---
 
@@ -487,10 +493,10 @@ search region are ignored.
 
 Details:
 
-- Rotation bins: default `B_θ = 72` over the configured range (5° nominal), with a
+- Rotation bins: default `B_θ = 60` over the configured range (6° nominal), with a
   smooth orientation kernel rather than hard binning; orientation histograms for model
   and test points make pair lookup `O(1)` per orientation bin.
-- Scale bins: default `B_s = 8` log-spaced over `[s_min, s_max]`
+- Scale bins: default `B_s = 12` log-spaced over `[s_min, s_max]`
   (`s_b = s_min · (s_max/s_min)^(b/(B_s-1))`).
 - Accumulators are reused per `(θ_b, s_b)` to bound memory; peaks are local maxima in a
   `3×3` neighborhood above an adaptive fraction of the strongest peak. The top few
@@ -526,7 +532,7 @@ s = descriptor-radius ratio × pyramid-level ratio
 t = q_test - s R(θ) p_model
 ```
 
-Descriptor matching is capped (default 300 model corners and 1500 test corners per
+Descriptor matching is capped (default 300 model corners and 600 test corners per
 level) and parallelized. Brute force is acceptable at these caps; a kd-tree is added
 only if profiling requires it. Descriptor matches are hypotheses, never accepted
 detections: they pass through the same edge scoring and refinement as Hough peaks.
@@ -1165,14 +1171,14 @@ numerically.
 | Minimum edge chain | 4 px |
 | Corner response | Shi–Tomasi `λ_min`, quality 0.01 of max, NMS radius 5 px |
 | Minimum segment | 10 px |
-| Rotation search | `[-180°, 180°]`, 72 bins at coarse level |
-| Scale search | `[0.5, 2.0]`, 8 log bins |
+| Rotation search | `[-180°, 180°]`, 60 bins at coarse level |
+| Scale search | `[0.5, 2.0]`, 12 log bins |
 | Hough orientation bins | 32 model/test orientation buckets, smooth kernel |
 | Hypothesis sources | Hough + corner descriptors + segment pairs (`both`) |
 | Corner descriptor | shape context 5×12 log-polar + 8 orientation bins; radii 12/24/48 px; ratio test 0.8 |
-| Descriptor caps | 300 model corners, 1500 test corners per level |
+| Descriptor caps | 300 model corners, 600 test corners per level |
 | Segment-pair caps | 500 pairs per image; non-parallel pairs only |
-| Hypothesis cap | 300 after clustering |
+| Hypothesis cap | 150 after clustering; top 24 by coarse score verified |
 | Score `τ_d` | 2.5 px full resolution, scaled by level |
 | Score orientation exponent | 2 |
 | Coverage minimum | 0.4 |
@@ -1207,3 +1213,15 @@ the synthetic benchmark and real images are analyzed.
 | `q` (RANSAC) | probability that one minimal sample is all-inlier |
 | `k` | RANSAC minimal sample size (4 for homography) |
 | `N` | RANSAC iterations |
+
+
+# Payments done
+USD 713.30 - Latam Airlines - Ana Padilla
+USD 713.30 - Latam Airlines - Jorge Galleguillos
+CLP 169202 - Recibo de pasaje electrónico, 27 octubre para MS ANA LUISA PADILLA GONZALEZ
+CLP 208192 - Recibo de pasaje electrónico, 27 octubre para MR JORGE FRANCISCO GALLEGUILLOS AVILES
+MXN 7254.28 - Confirmación _ Viva mexico juarez
+
+The sum is approximately MXN 33,402.
+
+

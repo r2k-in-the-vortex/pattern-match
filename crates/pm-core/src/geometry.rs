@@ -48,7 +48,7 @@ pub fn affine_normalize(p: Vector3<f64>) -> Option<Vector2<f64>> {
 }
 
 /// A similarity pose `q = t + s · R(θ) · p` (README §4).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Similarity {
     /// Uniform scale relative to the taught size.
     pub scale: f64,
@@ -433,6 +433,16 @@ pub fn normalized_dlt(correspondences: &[(Vector2<f64>, Vector2<f64>)]) -> Optio
         return None;
     }
     Some(homography)
+}
+
+/// Convert a 3×3 matrix to a plain array for result serialization.
+#[must_use]
+pub fn matrix_to_array(matrix: &Matrix3<f64>) -> [[f64; 3]; 3] {
+    [
+        [matrix[(0, 0)], matrix[(0, 1)], matrix[(0, 2)]],
+        [matrix[(1, 0)], matrix[(1, 1)], matrix[(1, 2)]],
+        [matrix[(2, 0)], matrix[(2, 1)], matrix[(2, 2)]],
+    ]
 }
 
 /// A pose reported at the model zero (README §4, §9.9).
