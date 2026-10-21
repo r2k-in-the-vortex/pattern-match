@@ -6,13 +6,20 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M3 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
+**Status: M4 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
 polygon and brush masks with undo/redo, live feature preview, and `.pmodel`
 save/load. Models store model-frame features, three-scale corner descriptors,
 segment-pair invariants, mask primitives, and a derived mask raster; a
-save/reload round-trip reproduces them exactly. Formal DLT/RANSAC work begins
-at M4. This document is the implementation plan and the record of decisions
-made.
+save/reload round-trip reproduces them exactly. The Lean core now proves
+D1–D5 and R1–R5 with no `sorry`: DLT row exactness, the 8×9 rank/kernel count,
+general-position uniqueness and invertibility, collinear-source degeneracy, and
+Hartley-normalization equivalence; the all-inlier sampling probability, its
+conservative bound, the `N`-iteration success formula, monotonicity, and the
+required-iteration guarantee. Rust provides Hartley-normalized DLT with
+degeneracy rejection and seeded RANSAC with adaptive iteration counts, and the
+golden-vector test covers both. D6 (noisy least-squares optimality) remains the
+documented follow-on. This document is the implementation plan and the record
+of decisions made.
 
 ---
 

@@ -18,9 +18,12 @@
 //! * G8 — [`Homography::pose_at_origin`] extracts position, angle, and scale
 //!   from the local Jacobian at the model origin (`hasFDerivAt_affineMap`).
 //!
-//! DLT arrives in M4.
+//! The normalized DLT follows the projective-basis uniqueness argument of D3:
+//! four correspondences in general position determine the homography up to
+//! scale, and Hartley normalization makes the linear solve numerically stable
+//! (D5).  Degenerate triples are rejected before the solve (D4).
 
-use nalgebra::{Matrix2, Matrix3, Vector2, Vector3};
+use nalgebra::{DMatrix, Matrix2, Matrix3, Vector2, Vector3};
 use serde::{Deserialize, Serialize};
 
 /// Numerical tolerance for treating a homogeneous coordinate or determinant as
@@ -271,6 +274,165 @@ impl Homography {
             scale: det.abs().sqrt(),
         })
     }
+}
+
+/// Hartley normalization: translate the centroid to the origin and scale the
+/// mean distance to `√2` (README §10.3, D5).
+#[derive(Clone, Copy, Debug)]
+struct Normalization {
+    scale: f64,
+    cx: f64,
+    cy: f64,
+}
+
+impl Normalization {
+    /// The 3×3 transform mapping original points into normalized ones.
+    fn matrix(&self) -> Matrix3<f64> {
+        Matrix3::new(
+            self.scale,
+            0.0,
+            -self.scale * self.cx,
+            0.0,
+            self.scale,
+            -self.scale * self.cy,
+            0.0,
+            0.0,
+            1.0,
+        )
+    }
+
+    /// The inverse transform, mapping normalized points back.
+    fn inverse_matrix(&self) -> Matrix3<f64> {
+        let inv = 1.0 / self.scale;
+        Matrix3::new(inv, 0.0, self.cx, 0.0, inv, self.cy, 0.0, 0.0, 1.0)
+    }
+
+    /// Apply the normalization to an affine point.
+    fn apply(&self, p: Vector2<f64>) -> Vector2<f64> {
+        Vector2::new(self.scale * (p.x - self.cx), self.scale * (p.y - self.cy))
+    }
+
+    /// Compute the Hartley normalization of a point set.
+    fn from_points(points: &[Vector2<f64>]) -> Option<Self> {
+        if points.is_empty() {
+            return None;
+        }
+        let count = points.len() as f64;
+        let cx = points.iter().map(|p| p.x).sum::<f64>() / count;
+        let cy = points.iter().map(|p| p.y).sum::<f64>() / count;
+        let mean_distance = points
+            .iter()
+            .map(|p| (Vector2::new(p.x - cx, p.y - cy)).norm())
+            .sum::<f64>()
+            / count;
+        if !mean_distance.is_finite() || mean_distance <= NUMERIC_EPS {
+            return None;
+        }
+        Some(Self {
+            scale: std::f64::consts::SQRT_2 / mean_distance,
+            cx,
+            cy,
+        })
+    }
+}
+
+/// Whether any three of the points are collinear.  DLT requires four points in
+/// general position; a collinear triple is the hard geometric degeneracy of D4.
+///
+/// The cross-product test is relative to the lengths of the two edges, so it is
+/// stable under translation and uniform scaling of the point set.
+#[must_use]
+pub fn has_degenerate_triple(points: &[Vector2<f64>]) -> bool {
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            for k in (j + 1)..points.len() {
+                let a = points[i];
+                let b = points[j];
+                let c = points[k];
+                let ab = b - a;
+                let ac = c - a;
+                let cross = ab.x * ac.y - ab.y * ac.x;
+                let scale = ab.norm() * ac.norm();
+                if !cross.is_finite() || cross.abs() <= 1e-9 * scale.max(1.0) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Estimate a homography from point correspondences with normalized DLT
+/// (README §9.7, D1–D5).
+///
+/// The source and target points are Hartley-normalized independently (D5), the
+/// 2n×9 system is solved by SVD, and the solution is denormalized and scaled for
+/// output.  The result is `None` when there are fewer than four
+/// correspondences, when either point set has a collinear triple (D4), or when
+/// the recovered matrix is numerically singular.
+#[must_use]
+pub fn normalized_dlt(correspondences: &[(Vector2<f64>, Vector2<f64>)]) -> Option<Homography> {
+    if correspondences.len() < 4 {
+        return None;
+    }
+    let src: Vec<Vector2<f64>> = correspondences.iter().map(|(p, _)| *p).collect();
+    let dst: Vec<Vector2<f64>> = correspondences.iter().map(|(_, q)| *q).collect();
+    if src
+        .iter()
+        .chain(dst.iter())
+        .any(|p| !p.x.is_finite() || !p.y.is_finite())
+    {
+        return None;
+    }
+    if has_degenerate_triple(&src) || has_degenerate_triple(&dst) {
+        return None;
+    }
+    let src_norm = Normalization::from_points(&src)?;
+    let dst_norm = Normalization::from_points(&dst)?;
+
+    let rows = 2 * correspondences.len();
+    // Pad a four-point (8×9) system to 9×9 so the SVD exposes the full
+    // right-singular basis; otherwise the kernel vector would be the omitted
+    // ninth row of a thin Vᵀ.
+    let padded_rows = rows.max(9);
+    let mut a = DMatrix::<f64>::zeros(padded_rows, 9);
+    for (index, (src_point, dst_point)) in correspondences.iter().enumerate() {
+        let p = src_norm.apply(*src_point);
+        let q = dst_norm.apply(*dst_point);
+        let (x, y) = (p.x, p.y);
+        let (u, v) = (q.x, q.y);
+        let row = 2 * index;
+        a[(row, 0)] = -x;
+        a[(row, 1)] = -y;
+        a[(row, 2)] = -1.0;
+        a[(row, 6)] = u * x;
+        a[(row, 7)] = u * y;
+        a[(row, 8)] = u;
+        a[(row + 1, 3)] = -x;
+        a[(row + 1, 4)] = -y;
+        a[(row + 1, 5)] = -1.0;
+        a[(row + 1, 6)] = v * x;
+        a[(row + 1, 7)] = v * y;
+        a[(row + 1, 8)] = v;
+    }
+
+    let svd = a.svd(false, true);
+    let v_t = svd.v_t?;
+    if v_t.nrows() != 9 {
+        return None;
+    }
+    let h = v_t.row(8);
+    let h_norm = Matrix3::from_row_slice(&h.iter().copied().collect::<Vec<_>>());
+
+    let denormalized = dst_norm.inverse_matrix() * h_norm * src_norm.matrix();
+    let homography = Homography(denormalized).normalized_for_output();
+    let homography = Homography(homography);
+    if !homography.matrix().iter().all(|value| value.is_finite())
+        || homography.determinant().abs() <= NUMERIC_EPS
+    {
+        return None;
+    }
+    Some(homography)
 }
 
 /// A pose reported at the model zero (README §4, §9.9).
@@ -745,6 +907,96 @@ mod tests {
             .abs()
                 > 1e-9
         );
+    }
+
+    fn dlt_test_homography() -> Homography {
+        Homography::from_matrix(Matrix3::new(2.0, 0.0, 1.0, 0.0, 3.0, -2.0, 0.1, 0.05, 1.0))
+    }
+
+    fn dlt_test_correspondences(
+        h: &Homography,
+        points: &[[f64; 2]],
+    ) -> Vec<(Vector2<f64>, Vector2<f64>)> {
+        points
+            .iter()
+            .map(|p| {
+                let src = Vector2::new(p[0], p[1]);
+                (src, h.try_act_point(src).expect("finite homography"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn normalized_dlt_recovers_exact_homography_d1() {
+        let h = dlt_test_homography();
+        let points = [[0.0, 0.0], [4.0, 0.0], [0.0, 3.0], [2.0, 2.0]];
+        let correspondences = dlt_test_correspondences(&h, &points);
+        let solution = normalized_dlt(&correspondences).expect("general position");
+        assert_mat_close(
+            &solution.normalized_for_output(),
+            &h.normalized_for_output(),
+            "D1 exact four-point DLT",
+        );
+    }
+
+    #[test]
+    fn normalized_dlt_handles_overdetermined_data() {
+        let h = dlt_test_homography();
+        let points = [
+            [0.0, 0.0],
+            [4.0, 0.0],
+            [0.0, 3.0],
+            [2.0, 2.0],
+            [7.0, 1.0],
+            [-3.0, 5.0],
+        ];
+        let correspondences = dlt_test_correspondences(&h, &points);
+        let solution = normalized_dlt(&correspondences).expect("general position");
+        assert_mat_close(
+            &solution.normalized_for_output(),
+            &h.normalized_for_output(),
+            "D1 overdetermined DLT",
+        );
+    }
+
+    #[test]
+    fn normalized_dlt_rejects_collinear_sources_d4() {
+        let points = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 1.0]];
+        let correspondences: Vec<_> = points
+            .iter()
+            .map(|p| {
+                (
+                    Vector2::new(p[0], p[1]),
+                    Vector2::new(p[0] + 1.0, p[1] + 2.0),
+                )
+            })
+            .collect();
+        assert!(normalized_dlt(&correspondences).is_none());
+        assert!(has_degenerate_triple(
+            &points
+                .iter()
+                .map(|p| Vector2::new(p[0], p[1]))
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    #[test]
+    fn normalized_dlt_rejects_collinear_targets_d4() {
+        let h = dlt_test_homography();
+        let points = [[0.0, 0.0], [4.0, 0.0], [0.0, 3.0], [2.0, 2.0]];
+        let mut correspondences = dlt_test_correspondences(&h, &points);
+        for (index, (_, dst)) in correspondences.iter_mut().enumerate() {
+            *dst = Vector2::new(index as f64, 0.0);
+        }
+        assert!(normalized_dlt(&correspondences).is_none());
+    }
+
+    #[test]
+    fn normalized_dlt_requires_four_points() {
+        let h = dlt_test_homography();
+        let points = [[0.0, 0.0], [4.0, 0.0], [0.0, 3.0]];
+        let correspondences = dlt_test_correspondences(&h, &points);
+        assert!(normalized_dlt(&correspondences).is_none());
     }
 
     #[test]

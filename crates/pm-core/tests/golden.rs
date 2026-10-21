@@ -14,9 +14,10 @@ use std::path::PathBuf;
 
 use nalgebra::{Matrix3, Vector2, Vector3};
 use pm_core::geometry::{
-    Homography, Similarity, affine_normalize, cross_ratio, det_points, mobius,
+    Homography, Similarity, affine_normalize, cross_ratio, det_points, mobius, normalized_dlt,
     similarity_from_block,
 };
+use pm_core::refine::{required_iterations_exact, required_iterations_from_q};
 
 /// Relative tolerance for converting exact rational golden values to `f64`.
 const TOL: f64 = 1e-9;
@@ -34,6 +35,24 @@ struct SimilarityJson {
     theta_deg: String,
     tx: String,
     ty: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CorrespondenceJson {
+    x: String,
+    y: String,
+    u: String,
+    v: String,
+}
+
+impl CorrespondenceJson {
+    fn source(&self) -> Vector2<f64> {
+        Vector2::new(q(&self.x), q(&self.y))
+    }
+
+    fn target(&self) -> Vector2<f64> {
+        Vector2::new(q(&self.u), q(&self.v))
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -114,6 +133,84 @@ enum GoldenVector {
         #[serde(default)]
         expected_scale: Option<String>,
     },
+    #[serde(rename = "dlt_solution")]
+    DltSolution {
+        id: String,
+        theorem: String,
+        correspondences: Vec<CorrespondenceJson>,
+        expected: Vec<String>,
+        expected_det_nonzero: bool,
+    },
+    #[serde(rename = "dlt_degenerate")]
+    DltDegenerate {
+        id: String,
+        theorem: String,
+        correspondences: Vec<CorrespondenceJson>,
+        expected_rejected: bool,
+    },
+    #[serde(rename = "ransac_probability")]
+    RansacProbability {
+        id: String,
+        theorem: String,
+        n: usize,
+        #[serde(rename = "I")]
+        inliers: usize,
+        k: usize,
+        expected_favorable: usize,
+        expected_total: usize,
+        expected_q: String,
+        expected_bound: String,
+    },
+    #[serde(rename = "ransac_bound")]
+    RansacBound {
+        id: String,
+        theorem: String,
+        n: usize,
+        #[serde(rename = "I")]
+        inliers: usize,
+        k: usize,
+        expected_q: String,
+        expected_bound: String,
+    },
+    #[serde(rename = "ransac_success")]
+    RansacSuccess {
+        id: String,
+        theorem: String,
+        q: String,
+        #[serde(rename = "N")]
+        iterations: usize,
+        expected: String,
+    },
+    #[serde(rename = "ransac_monotonicity")]
+    RansacMonotonicity {
+        id: String,
+        theorem: String,
+        q: String,
+        #[serde(rename = "N_low")]
+        n_low: usize,
+        #[serde(rename = "N_high")]
+        n_high: usize,
+        n: usize,
+        #[serde(rename = "I_low")]
+        inliers_low: usize,
+        #[serde(rename = "I_high")]
+        inliers_high: usize,
+        #[serde(rename = "k_low")]
+        k_low: usize,
+        #[serde(rename = "k_high")]
+        k_high: usize,
+        expected_monotone: bool,
+    },
+    #[serde(rename = "ransac_iterations")]
+    RansacIterations {
+        id: String,
+        theorem: String,
+        #[serde(rename = "P")]
+        confidence: String,
+        q: String,
+        cap: usize,
+        expected: usize,
+    },
 }
 
 impl GoldenVector {
@@ -126,7 +223,14 @@ impl GoldenVector {
             | Self::SimilarityDecomposition { id, .. }
             | Self::CrossRatio { id, .. }
             | Self::Collinearity { id, .. }
-            | Self::Jacobian { id, .. } => id,
+            | Self::Jacobian { id, .. }
+            | Self::DltSolution { id, .. }
+            | Self::DltDegenerate { id, .. }
+            | Self::RansacProbability { id, .. }
+            | Self::RansacBound { id, .. }
+            | Self::RansacSuccess { id, .. }
+            | Self::RansacMonotonicity { id, .. }
+            | Self::RansacIterations { id, .. } => id,
         }
     }
 
@@ -139,7 +243,14 @@ impl GoldenVector {
             | Self::SimilarityDecomposition { theorem, .. }
             | Self::CrossRatio { theorem, .. }
             | Self::Collinearity { theorem, .. }
-            | Self::Jacobian { theorem, .. } => theorem,
+            | Self::Jacobian { theorem, .. }
+            | Self::DltSolution { theorem, .. }
+            | Self::DltDegenerate { theorem, .. }
+            | Self::RansacProbability { theorem, .. }
+            | Self::RansacBound { theorem, .. }
+            | Self::RansacSuccess { theorem, .. }
+            | Self::RansacMonotonicity { theorem, .. }
+            | Self::RansacIterations { theorem, .. } => theorem,
         }
     }
 }
@@ -429,7 +540,190 @@ fn check_vector(vector: &GoldenVector) {
                 assert_close(pose.scale, q(scale), id, theorem, "pose scale");
             }
         }
+        GoldenVector::DltSolution {
+            correspondences,
+            expected,
+            expected_det_nonzero,
+            ..
+        } => {
+            let points: Vec<_> = correspondences
+                .iter()
+                .map(|c| (c.source(), c.target()))
+                .collect();
+            let solution =
+                normalized_dlt(&points).expect("golden correspondence set is not degenerate");
+            let actual = solution.normalized_for_output();
+            let expected = mat3(expected, id);
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert_close(
+                        actual[(i, j)],
+                        expected[(i, j)],
+                        id,
+                        theorem,
+                        &format!("DLT solution[{i},{j}]"),
+                    );
+                }
+            }
+            if *expected_det_nonzero {
+                assert!(
+                    solution.determinant().abs() > 1e-9,
+                    "{id} [{theorem}]: expected a non-singular solution"
+                );
+            }
+        }
+        GoldenVector::DltDegenerate {
+            correspondences,
+            expected_rejected,
+            ..
+        } => {
+            let points: Vec<_> = correspondences
+                .iter()
+                .map(|c| (c.source(), c.target()))
+                .collect();
+            let solution = normalized_dlt(&points);
+            if *expected_rejected {
+                assert!(
+                    solution.is_none(),
+                    "{id} [{theorem}]: degenerate sample was accepted"
+                );
+            } else {
+                assert!(
+                    solution.is_some(),
+                    "{id} [{theorem}]: valid sample was rejected"
+                );
+            }
+        }
+        GoldenVector::RansacProbability {
+            n,
+            inliers,
+            k,
+            expected_favorable,
+            expected_total,
+            expected_q,
+            expected_bound,
+            ..
+        } => {
+            let (favorable, total) = choose_ratio(*n, *inliers, *k);
+            assert_eq!(
+                favorable, *expected_favorable,
+                "{id} [{theorem}]: favorable sample count"
+            );
+            assert_eq!(
+                total, *expected_total,
+                "{id} [{theorem}]: total sample count"
+            );
+            let probability = favorable as f64 / total as f64;
+            assert_close(
+                probability,
+                q(expected_q),
+                id,
+                theorem,
+                "all-inlier probability",
+            );
+            let bound = (*inliers as f64 / *n as f64).powi(*k as i32);
+            assert_close(bound, q(expected_bound), id, theorem, "conservative bound");
+            assert!(
+                probability <= bound + 1e-12,
+                "{id} [{theorem}]: probability {probability} exceeds bound {bound}"
+            );
+        }
+        GoldenVector::RansacBound {
+            n,
+            inliers,
+            k,
+            expected_q,
+            expected_bound,
+            ..
+        } => {
+            let (favorable, total) = choose_ratio(*n, *inliers, *k);
+            let probability = favorable as f64 / total as f64;
+            assert_close(probability, q(expected_q), id, theorem, "probability");
+            let bound = (*inliers as f64 / *n as f64).powi(*k as i32);
+            assert_close(bound, q(expected_bound), id, theorem, "bound");
+            assert!(
+                probability <= bound + 1e-12,
+                "{id} [{theorem}]: R2 bound violated: {probability} > {bound}"
+            );
+        }
+        GoldenVector::RansacSuccess {
+            q: success_q,
+            iterations,
+            expected,
+            ..
+        } => {
+            let success_q = q(success_q);
+            let actual = 1.0 - (1.0 - success_q).powi(*iterations as i32);
+            assert_close(actual, q(expected), id, theorem, "success probability");
+        }
+        GoldenVector::RansacMonotonicity {
+            q: success_q,
+            n_low,
+            n_high,
+            n,
+            inliers_low,
+            inliers_high,
+            k_low,
+            k_high,
+            expected_monotone,
+            ..
+        } => {
+            let success_q = q(success_q);
+            let success = |iterations: usize| 1.0 - (1.0 - success_q).powi(iterations as i32);
+            let inlier_probability = |inliers: usize, k: usize| {
+                let (favorable, total) = choose_ratio(*n, inliers, k);
+                favorable as f64 / total as f64
+            };
+            let monotone_in_n = success(*n_low) <= success(*n_high) + 1e-12;
+            let monotone_in_i = inlier_probability(*inliers_low, *k_low)
+                <= inlier_probability(*inliers_high, *k_low) + 1e-12;
+            let monotone_in_k = inlier_probability(*inliers_high, *k_high)
+                <= inlier_probability(*inliers_high, *k_low) + 1e-12;
+            if *expected_monotone {
+                assert!(
+                    monotone_in_n && monotone_in_i && monotone_in_k,
+                    "{id} [{theorem}]: monotonicity failed: N {monotone_in_n}, \
+                     I {monotone_in_i}, k {monotone_in_k}"
+                );
+            }
+        }
+        GoldenVector::RansacIterations {
+            confidence,
+            q: sample_q,
+            cap,
+            expected,
+            ..
+        } => {
+            let confidence = q(confidence);
+            let sample_q = q(sample_q);
+            let exact = required_iterations_exact(confidence, sample_q, *cap);
+            assert_eq!(exact, *expected, "{id} [{theorem}]: exact iteration count");
+            let formula = required_iterations_from_q(confidence, sample_q, *cap);
+            assert_eq!(
+                formula, *expected,
+                "{id} [{theorem}]: log-formula iteration count"
+            );
+            let success = 1.0 - (1.0 - sample_q).powi(*expected as i32);
+            assert!(
+                success + 1e-12 >= confidence,
+                "{id} [{theorem}]: success {success} below confidence {confidence}"
+            );
+        }
     }
+}
+
+/// Exact binomial coefficient for small golden-vector arguments.
+fn choose(n: usize, k: usize) -> usize {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    (0..k).fold(1usize, |acc, i| acc * (n - i) / (i + 1))
+}
+
+/// Favorable and total counts for the all-inlier sample event (R1).
+fn choose_ratio(n: usize, inliers: usize, k: usize) -> (usize, usize) {
+    (choose(inliers, k), choose(n, k))
 }
 
 #[test]
@@ -462,7 +756,10 @@ fn committed_golden_vectors_conform_to_spec() {
         check_vector(vector);
     }
 
-    for required in ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"] {
+    for required in [
+        "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "D3", "D4", "D5", "R1", "R2", "R3", "R4",
+        "R5",
+    ] {
         assert!(
             theorems.contains(required),
             "golden vectors do not cover theorem {required}"

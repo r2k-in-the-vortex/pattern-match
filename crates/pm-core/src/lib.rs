@@ -31,13 +31,18 @@ pub use feature::{
     Corner, EdgeChain, EdgePoint, EdgeSet, FeatureParams, FeatureSet, Segment, extract_features,
     filter_features,
 };
-pub use geometry::{RotatedRect, ZeroFrame};
+pub use geometry::{
+    Homography, RotatedRect, Similarity, ZeroFrame, has_degenerate_triple, normalized_dlt,
+};
 pub use gray::{GrayF32, LoadedImage, load_image};
 pub use image::RgbaImage;
 pub use mask::{MaskBounds, MaskPrimitive, MaskRaster};
 pub use model::{HypothesisSources, Model, SearchDefaults, TeachSettings, mask_bounds_for};
 pub use overlay::{OverlayOptions, render_overlay};
 pub use pyramid::Pyramid;
+pub use refine::{
+    RansacParams, RansacResult, ransac_homography, required_iterations, required_iterations_from_q,
+};
 
 /// Version of the `pm-core` crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

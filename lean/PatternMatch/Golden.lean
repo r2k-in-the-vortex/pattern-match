@@ -301,12 +301,232 @@ def geometryVectors : List String :=
    g8GeneralVector,
    g8SimilarityVector]
 
+/-! ## M4 DLT vectors -/
+
+/-- An affine correspondence with exact rational coordinates. -/
+structure CorrQ where
+  x : Q
+  y : Q
+  u : Q
+  v : Q
+
+def srcQ (c : CorrQ) : P3 := p3 c.x c.y 1
+
+def dstQ (c : CorrQ) : P3 := p3 c.u c.v 1
+
+/-- The matrix whose columns are three homogeneous points. -/
+def colsQ (p q r : P3) : M3 := fun i j => vec3 p q r j i
+
+/-- Coordinates of a point in the projective basis given by `P`. -/
+def coordsQ (P : M3) (x : P3) : P3 := matVec (inverse3 P) x
+
+def diagQ (a b c : Q) : M3 := m3 a 0 0 0 b 0 0 0 c
+
+/-- Apply a homography in affine coordinates. -/
+def applyH (H : M3) (p : P3) : P3 := normalizeP (matVec H p)
+
+/-- Build a correspondence from a source point and a homography. -/
+def corrFromH (H : M3) (x y : Q) : CorrQ :=
+  let q := applyH H (p3 x y 1)
+  { x := x, y := y, u := q 0, v := q 1 }
+
+/-- The DLT solution from the projective-basis construction (D3). -/
+def dltSolution (c0 c1 c2 c3 : CorrQ) : M3 :=
+  let p0 := srcQ c0
+  let p1 := srcQ c1
+  let p2 := srcQ c2
+  let p3v := srcQ c3
+  let q0 := dstQ c0
+  let q1 := dstQ c1
+  let q2 := dstQ c2
+  let q3 := dstQ c3
+  let P := colsQ p0 p1 p2
+  let T := colsQ q0 q1 q2
+  let a := coordsQ P p3v
+  let b := coordsQ T q3
+  let D := diagQ (b 0 / a 0) (b 1 / a 1) (b 2 / a 2)
+  matMul (matMul T D) (inverse3 P)
+
+/-- Normalize a matrix by `h33`. -/
+def normalizeMat (H : M3) : M3 := fun i j => H i j / H 2 2
+
+def corrJson (c : CorrQ) : String :=
+  obj [
+    ("x", ratJson c.x),
+    ("y", ratJson c.y),
+    ("u", ratJson c.u),
+    ("v", ratJson c.v)
+  ]
+
+def corrListJson (cs : List CorrQ) : String :=
+  "[" ++ String.intercalate "," (cs.map corrJson) ++ "]"
+
+def natJson (n : Nat) : String := toString n
+
+def boolJson (b : Bool) : String := if b then "true" else "false"
+
+/-- A general-position DLT vector: four correspondences from a known
+homography, plus the normalized DLT solution. -/
+def dltGeneralVector (id thm : String) (H : M3) (pts : List (Q × Q)) : String :=
+  match pts with
+  | [(x0, y0), (x1, y1), (x2, y2), (x3, y3)] =>
+      let cs := [corrFromH H x0 y0, corrFromH H x1 y1,
+                 corrFromH H x2 y2, corrFromH H x3 y3]
+      match cs with
+      | [c0, c1, c2, c3] =>
+          let solved := normalizeMat (dltSolution c0 c1 c2 c3)
+          obj [
+            ("kind", strJson "dlt_solution"),
+            ("id", strJson id),
+            ("theorem", strJson thm),
+            ("correspondences", corrListJson cs),
+            ("expected", m3Json solved),
+            ("expected_det_nonzero", boolJson (decide (det3 solved ≠ 0)))
+          ]
+      | _ =>
+          obj [("kind", strJson "dlt_solution"), ("id", strJson id),
+               ("theorem", strJson thm), ("correspondences", "[]"),
+               ("expected", m3Json (m3 0 0 0 0 0 0 0 0 0)),
+               ("expected_det_nonzero", boolJson false)]
+  | _ => obj [("kind", strJson "dlt_solution"), ("id", strJson id),
+              ("theorem", strJson thm), ("correspondences", "[]"),
+              ("expected", m3Json (m3 0 0 0 0 0 0 0 0 0)),
+              ("expected_det_nonzero", boolJson false)]
+
+/-- A collinear-source DLT vector: the implementation must reject it. -/
+def dltDegenerateVector (id : String) (cs : List CorrQ) : String :=
+  obj [
+    ("kind", strJson "dlt_degenerate"),
+    ("id", strJson id),
+    ("theorem", strJson "D4"),
+    ("correspondences", corrListJson cs),
+    ("expected_rejected", boolJson true)
+  ]
+
+def dltVectors : List String :=
+  let H := m3 2 0 1 0 3 (-2) (1 / 10) (1 / 20) 1
+  let Minv := m3 (1 / 1000) 0 (-10) 0 (1 / 1000) (-20) 0 0 1
+  let Hlarge := matMul H Minv
+  [dltGeneralVector "D3-general" "D3" H [(0, 0), (4, 0), (0, 3), (2, 2)],
+   dltGeneralVector "D5-large-coordinates" "D5" Hlarge
+     [(10000, 20000), (14000, 20000), (10000, 23000), (12000, 22000)],
+   dltDegenerateVector "D4-collinear-sources" [
+     { x := 0, y := 0, u := 0, v := 0 },
+     { x := 1, y := 0, u := 2, v := 1 },
+     { x := 2, y := 0, u := 4, v := 2 },
+     { x := 0, y := 1, u := 1, v := 5 }]]
+
+/-! ## M4 RANSAC vectors -/
+
+/-- Binomial coefficient over the naturals. -/
+def chooseNat : Nat → Nat → Nat
+  | _, 0 => 1
+  | 0, _ + 1 => 0
+  | n + 1, k + 1 => chooseNat n k + chooseNat n (k + 1)
+
+/-- Exact all-inlier sampling probability. -/
+def sampleProb (n I k : Nat) : Q :=
+  (chooseNat I k : Q) / (chooseNat n k : Q)
+
+/-- Exact conservative bound `(I/n)^k`. -/
+def boundProb (n I k : Nat) : Q := ((I : Q) / (n : Q)) ^ k
+
+/-- Exact success probability after `N` iterations. -/
+def successProb (q : Q) (N : Nat) : Q := 1 - (1 - q) ^ N
+
+/-- Exact required iteration count, capped by a fuel argument. -/
+def requiredItersAux (P q : Q) : Nat → Nat → Nat
+  | 0, N => N
+  | fuel + 1, N =>
+      if successProb q N ≥ P then N else requiredItersAux P q fuel (N + 1)
+
+def requiredIters (P q : Q) (cap : Nat) : Nat := requiredItersAux P q cap 0
+
+def ransacProbabilityVector (id : String) (n I k : Nat) : String :=
+  obj [
+    ("kind", strJson "ransac_probability"),
+    ("id", strJson id),
+    ("theorem", strJson "R1"),
+    ("n", natJson n),
+    ("I", natJson I),
+    ("k", natJson k),
+    ("expected_favorable", natJson (chooseNat I k)),
+    ("expected_total", natJson (chooseNat n k)),
+    ("expected_q", ratJson (sampleProb n I k)),
+    ("expected_bound", ratJson (boundProb n I k))
+  ]
+
+def ransacSuccessVector (id : String) (q : Q) (N : Nat) : String :=
+  obj [
+    ("kind", strJson "ransac_success"),
+    ("id", strJson id),
+    ("theorem", strJson "R3"),
+    ("q", ratJson q),
+    ("N", natJson N),
+    ("expected", ratJson (successProb q N))
+  ]
+
+def ransacIterationsVector (id : String) (P q : Q) (cap : Nat) : String :=
+  obj [
+    ("kind", strJson "ransac_iterations"),
+    ("id", strJson id),
+    ("theorem", strJson "R5"),
+    ("P", ratJson P),
+    ("q", ratJson q),
+    ("cap", natJson cap),
+    ("expected", natJson (requiredIters P q cap))
+  ]
+
+/-- R2: the conservative bound on the all-inlier probability. -/
+def ransacBoundVector (id : String) (n I k : Nat) : String :=
+  obj [
+    ("kind", strJson "ransac_bound"),
+    ("id", strJson id),
+    ("theorem", strJson "R2"),
+    ("n", natJson n),
+    ("I", natJson I),
+    ("k", natJson k),
+    ("expected_q", ratJson (sampleProb n I k)),
+    ("expected_bound", ratJson (boundProb n I k))
+  ]
+
+/-- R4: the three monotonicity directions. -/
+def ransacMonotonicityVector (id : String) (q : Q) (N_low N_high : Nat)
+    (n I_low I_high k_low k_high : Nat) : String :=
+  obj [
+    ("kind", strJson "ransac_monotonicity"),
+    ("id", strJson id),
+    ("theorem", strJson "R4"),
+    ("q", ratJson q),
+    ("N_low", natJson N_low),
+    ("N_high", natJson N_high),
+    ("n", natJson n),
+    ("I_low", natJson I_low),
+    ("I_high", natJson I_high),
+    ("k_low", natJson k_low),
+    ("k_high", natJson k_high),
+    ("expected_monotone", boolJson true)
+  ]
+
+def ransacVectors : List String :=
+  [ransacProbabilityVector "R1-100-40-4" 100 40 4,
+   ransacProbabilityVector "R1-20-7-3" 20 7 3,
+   ransacProbabilityVector "R1-10-4-2" 10 4 2,
+   ransacBoundVector "R2-100-40-4" 100 40 4,
+   ransacBoundVector "R2-10-4-2" 10 4 2,
+   ransacSuccessVector "R3-half-5" (1 / 2) 5,
+   ransacSuccessVector "R3-nine-tenths-3" (9 / 10) 3,
+   ransacMonotonicityVector "R4-half" (1 / 2) 2 5 100 20 40 2 4,
+   ransacIterationsVector "R5-99-50" (99 / 100) (1 / 2) 1000,
+   ransacIterationsVector "R5-999-50" (999 / 1000) (1 / 2) 1000,
+   ransacIterationsVector "R5-99-90" (99 / 100) (9 / 10) 1000]
+
 /-- Render pre-serialized vector objects as the golden-vector JSON document. -/
 def renderJson (vectors : List String) : String :=
   "{\"format\":\"" ++ formatId ++ "\",\"version\":" ++ toString formatVersion ++
     ",\"vectors\":[" ++ String.intercalate "," vectors ++ "]}"
 
-/-- The M1 golden-vector document. -/
-def allJson : String := renderJson geometryVectors
+/-- The golden-vector document (geometry, DLT, RANSAC). -/
+def allJson : String := renderJson (geometryVectors ++ dltVectors ++ ransacVectors)
 
 end PatternMatch.Golden
