@@ -804,7 +804,7 @@ impl RunState {
             && let (Some(result), Some(model), Some(index)) = (&self.result, model, self.selected)
             && let Some(record) = result.document.detections.get(index)
         {
-            draw_selected_detection(painter, rect, scale, model, record);
+            draw_selected_detection(painter, rect, scale, model, index, record);
         }
         painter.text(
             rect.left_top() + egui::vec2(8.0, 8.0),
@@ -955,11 +955,19 @@ fn draw_selected_detection(
     rect: Rect,
     scale: f32,
     model: &Model,
+    index: usize,
     record: &pm_core::DetectionRecord,
 ) {
     let homography = Homography::from_array(record.homography);
     let roi_model = model_roi_in_model_coords(model);
-    let color = Color32::from_rgb(255, 255, 255);
+    // Keep the detection's own outline hue and lighten it so the selection is
+    // still visible over light image areas.
+    let base = pm_core::DETECTION_COLORS[index % pm_core::DETECTION_COLORS.len()];
+    let color = Color32::from_rgb(
+        lighten_channel(base[0]),
+        lighten_channel(base[1]),
+        lighten_channel(base[2]),
+    );
     let corners: Vec<Pos2> = roi_model
         .iter()
         .filter_map(|&corner| homography.try_act_array(corner))
@@ -996,6 +1004,11 @@ fn draw_selected_detection(
             color,
         );
     }
+}
+
+/// Blend one 8-bit color channel a third of the way toward white.
+fn lighten_channel(channel: u8) -> u8 {
+    (f32::from(channel) + (255.0 - f32::from(channel)) / 3.0).round() as u8
 }
 
 fn roi_axis_length(roi_model: &[[f32; 2]; 4]) -> f32 {
