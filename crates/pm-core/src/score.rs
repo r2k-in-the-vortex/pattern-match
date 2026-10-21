@@ -1,17 +1,19 @@
 //! Edge-based scoring, confidence, and pose non-maximum suppression
 //! (README §9.5, §9.8, §9.9).
 //!
-//! Scoring projects model edge points through a similarity pose, samples the
-//! test-level distance transform and gradient field, and accumulates a
-//! normalized weighted quality.  A homography-aware variant arrives with M6;
-//! the similarity path here is shared by every coarse hypothesis source.
+//! Scoring projects model edge points through a similarity pose or a
+//! homography, samples the test-level distance transform and gradient field,
+//! and accumulates a normalized weighted quality.  The homography path maps
+//! each normal by the inverse-transpose of the local Jacobian; both paths are
+//! normalization-compatible so the perspective validation gate can compare
+//! their scores directly.
 
 use nalgebra::Vector2;
 use serde::{Deserialize, Serialize};
 
 use crate::edge::DistanceField;
 use crate::feature::EdgePoint;
-use crate::geometry::Similarity;
+use crate::geometry::{Homography, NUMERIC_EPS, Similarity, homogenize};
 use crate::gradient::GradientField;
 
 /// Which coarse stage produced a hypothesis (README §9.3).
@@ -149,6 +151,110 @@ pub fn score_similarity(
         }
     }
 
+    finish_score(
+        total_weight,
+        visible_weight,
+        matched_weight,
+        quality_sum,
+        distance_sum,
+        orientation_sum,
+    )
+}
+
+/// Score a homography against one test level (README §9.5, §9.7).
+///
+/// Each model point is projected through `homography`; its normal is mapped by
+/// the inverse-transpose of the local Jacobian.  Points behind the camera
+/// (non-positive homogeneous depth) are treated as invisible.  The score is the
+/// same normalized weighted fraction as [`score_similarity`], so a similarity
+/// fallback and an estimated homography can be compared directly by the
+/// validation gate.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn score_homography(
+    model_points: &[EdgePoint],
+    width: usize,
+    height: usize,
+    gradient: &GradientField,
+    distance: &DistanceField,
+    homography: &Homography,
+    tau_d: f32,
+    params: &ScoreParams,
+) -> ScoreDiagnostics {
+    if model_points.is_empty() || width == 0 || height == 0 || tau_d <= 0.0 {
+        return ScoreDiagnostics::default();
+    }
+    let max_x = (width - 1) as f64;
+    let max_y = (height - 1) as f64;
+    let power = params.orientation_power.max(0.0) as f64;
+    let mut total_weight = 0.0f64;
+    let mut visible_weight = 0.0f64;
+    let mut matched_weight = 0.0f64;
+    let mut quality_sum = 0.0f64;
+    let mut distance_sum = 0.0f64;
+    let mut orientation_sum = 0.0f64;
+
+    for point in model_points {
+        let weight = f64::from(point.weight.max(0.0));
+        total_weight += weight;
+        let p = Vector2::new(f64::from(point.x), f64::from(point.y));
+        let mapped = homography.act_homogeneous(homogenize(p));
+        if !mapped.z.is_finite() || mapped.z <= NUMERIC_EPS {
+            continue;
+        }
+        let q = Vector2::new(mapped.x / mapped.z, mapped.y / mapped.z);
+        if q.x < 0.0 || q.y < 0.0 || q.x > max_x || q.y > max_y {
+            continue;
+        }
+        visible_weight += weight;
+
+        let normal =
+            homography.transform_normal(p, Vector2::new(f64::from(point.nx), f64::from(point.ny)));
+        let (gx, gy) = gradient.sample(q.x as f32, q.y as f32);
+        let (gx, gy) = (f64::from(gx), f64::from(gy));
+        let magnitude = gx.hypot(gy);
+        let reliability = reliability(magnitude, params);
+        let agreement = match normal {
+            Some(normal) if magnitude > 1e-9 => {
+                let dot = (normal.x * gx + normal.y * gy) / magnitude;
+                if params.polarity_enabled {
+                    (dot * f64::from(point.sign)).max(0.0)
+                } else {
+                    dot.abs()
+                }
+            }
+            _ => 0.0,
+        };
+        let edge_distance = f64::from(distance.sample(q.x as f32, q.y as f32));
+        let proximity = (1.0 - edge_distance / f64::from(tau_d)).max(0.0);
+        let quality = weight * proximity * agreement.powf(power) * reliability;
+        quality_sum += quality;
+        orientation_sum += weight * agreement * reliability;
+        if quality > 0.0 {
+            matched_weight += weight;
+            distance_sum += weight * edge_distance;
+        }
+    }
+
+    finish_score(
+        total_weight,
+        visible_weight,
+        matched_weight,
+        quality_sum,
+        distance_sum,
+        orientation_sum,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_score(
+    total_weight: f64,
+    visible_weight: f64,
+    matched_weight: f64,
+    quality_sum: f64,
+    distance_sum: f64,
+    orientation_sum: f64,
+) -> ScoreDiagnostics {
     let score = if visible_weight > 0.0 {
         (quality_sum / visible_weight).clamp(0.0, 1.0)
     } else {
@@ -210,14 +316,21 @@ pub struct DetectionDiagnostics {
     pub mean_orientation_agreement: f32,
     /// Coarse hypothesis source.
     pub seed_source: SeedSource,
-    /// Correspondence count (filled by M6).
+    /// Number of correspondences assembled for homography estimation, or zero
+    /// when the homography stage did not run.
     pub correspondences: usize,
-    /// RANSAC inlier count (filled by M6).
+    /// Correspondences consistent with the final reported homography.
     pub inliers: usize,
-    /// RANSAC iteration count (filled by M6).
+    /// RANSAC iterations executed for the homography estimate.
     pub ransac_iterations: usize,
-    /// Whether a validated homography was used.
-    pub homography_estimated: bool,
+    /// Corner correspondences assembled under the final geometry.  Kept out of
+    /// the result JSON so the documented schema stays exact; used for tuning
+    /// and diagnostic tests.
+    #[serde(skip)]
+    pub corner_correspondences: usize,
+    /// Corner correspondences consistent with the final homography.
+    #[serde(skip)]
+    pub corner_inliers: usize,
     /// Homography condition number, when estimated.
     pub homography_condition: Option<f64>,
     /// Margin to the best overlapping competing detection.
@@ -227,13 +340,19 @@ pub struct DetectionDiagnostics {
 }
 
 /// A single detection.
+///
+/// This is the internal record.  For the versioned result JSON of README
+/// §12.3, serialize a [`crate::result::ResultsFile`]; the derived serde form
+/// here is an internal representation and does not rename pose fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Detection {
     /// Sequential detection id, assigned by NMS.
     pub id: usize,
-    /// Reported pose at the model zero.
+    /// Reported pose at the model zero.  For an accepted homography this is the
+    /// local Jacobian decomposition of README §4, not a global similarity.
     pub pose: Similarity,
-    /// 3×3 homography mapping model to image (similarity embedding in M5).
+    /// 3×3 homography mapping model to image.  When
+    /// [`Detection::homography_estimated`] is false this embeds the similarity.
     pub homography: [[f64; 3]; 3],
     /// Whether the homography was estimated from perspective evidence.
     pub homography_estimated: bool,
@@ -374,9 +493,24 @@ fn overlaps(
     if same_pose {
         return true;
     }
-    let first = transformed_roi(&a.pose, roi_model);
-    let second = transformed_roi(&b.pose, roi_model);
+    let first = detection_roi(a, roi_model);
+    let second = detection_roi(b, roi_model);
     polygon_iou(&first, &second) > f64::from(params.iou_threshold)
+}
+
+/// Transformed ROI corners for a detection: the homography when one was
+/// estimated, otherwise the similarity embedding.
+fn detection_roi(detection: &Detection, roi_model: &[[f32; 2]; 4]) -> [[f64; 2]; 4] {
+    if !detection.homography_estimated {
+        return transformed_roi(&detection.pose, roi_model);
+    }
+    let homography = Homography::from_array(detection.homography);
+    roi_model.map(|corner| {
+        let p = Vector2::new(f64::from(corner[0]), f64::from(corner[1]));
+        homography
+            .try_act_point(p)
+            .map_or([p.x, p.y], |mapped| [mapped.x, mapped.y])
+    })
 }
 
 fn angle_distance(a: f32, b: f32) -> f32 {
@@ -594,6 +728,94 @@ mod tests {
             exact.score,
             rotated.score
         );
+    }
+
+    #[test]
+    fn homography_score_matches_similarity_for_an_embedded_pose() {
+        let (gradient, distance) = horizontal_edge_field();
+        let points = vec![
+            edge_point(10.0, 0.0, 0.0, 1.0),
+            edge_point(20.0, 0.0, 0.0, 1.0),
+            edge_point(30.0, 0.0, 0.0, 1.0),
+        ];
+        let pose = Similarity::from_pose(2.0, 19.0, 0.05, 1.02);
+        let similarity = score_similarity(
+            &points,
+            40,
+            40,
+            &gradient,
+            &distance,
+            &pose,
+            2.5,
+            &ScoreParams::default(),
+        );
+        let homography = score_homography(
+            &points,
+            40,
+            40,
+            &gradient,
+            &distance,
+            &pose.embed(),
+            2.5,
+            &ScoreParams::default(),
+        );
+        assert!(
+            (similarity.score - homography.score).abs() < 1e-5,
+            "similarity {} vs homography {}",
+            similarity.score,
+            homography.score
+        );
+        assert!(
+            (similarity.coverage - homography.coverage).abs() < 1e-5,
+            "coverage differs"
+        );
+    }
+
+    #[test]
+    fn homography_score_is_maximal_for_an_exact_translation() {
+        let (gradient, distance) = horizontal_edge_field();
+        let points = vec![
+            edge_point(10.0, 0.0, 0.0, 1.0),
+            edge_point(20.0, 0.0, 0.0, 1.0),
+            edge_point(30.0, 0.0, 0.0, 1.0),
+        ];
+        let homography =
+            Homography::from_matrix(Matrix3::new(1.0, 0.0, 0.0, 0.0, 1.0, 20.0, 0.0, 0.0, 1.0));
+        let result = score_homography(
+            &points,
+            40,
+            40,
+            &gradient,
+            &distance,
+            &homography,
+            2.5,
+            &ScoreParams::default(),
+        );
+        assert!(result.score > 0.99, "score {}", result.score);
+        assert!((result.mean_distance).abs() < 1e-3);
+    }
+
+    #[test]
+    fn points_behind_the_camera_are_invisible() {
+        let (gradient, distance) = horizontal_edge_field();
+        let points = vec![
+            edge_point(10.0, 0.0, 0.0, 1.0),
+            edge_point(20.0, 0.0, 0.0, 1.0),
+        ];
+        let behind =
+            Homography::from_matrix(Matrix3::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.01, 0.0, -1.0));
+        let result = score_homography(
+            &points,
+            40,
+            40,
+            &gradient,
+            &distance,
+            &behind,
+            2.5,
+            &ScoreParams::default(),
+        );
+        assert_eq!(result.coverage, 0.0);
+        assert_eq!(result.score, 0.0);
     }
 
     #[test]

@@ -2,9 +2,11 @@
 //! and segment-pair seeding, hypothesis clustering, coarse-to-fine
 //! verification, refinement, and multi-instance NMS (README §9.1–§9.8).
 //!
-//! The similarity search is the M5 detector.  Homography evidence (M6) upgrades
-//! accepted detections after this stage; here every detection reports the
-//! similarity embedding with `homography_estimated = false`.
+//! The similarity search is the M5 detector.  After full-resolution refinement
+//! each candidate passes through the M6 homography stage ([`refine_homography`]):
+//! correspondences are assembled, RANSAC and robust LM estimate an 8-DOF
+//! homography, and a validation gate either accepts it or reports the
+//! similarity embedding as the auditable fallback.
 
 use std::time::Instant;
 
@@ -24,7 +26,10 @@ use crate::geometry::{RotatedRect, Similarity, matrix_to_array};
 use crate::gradient::GradientField;
 use crate::model::{HypothesisSources, Model, SearchDefaults};
 use crate::pyramid::Pyramid;
-use crate::refine::{SimilarityRefineParams, refine_similarity_level};
+use crate::refine::{
+    HomographyInput, HomographyParams, SimilarityRefineParams, refine_homography,
+    refine_similarity_level,
+};
 use crate::score::{
     Detection, DetectionDiagnostics, NmsParams, ScoreDiagnostics, ScoreParams, SeedSource,
     confidence_from, non_maximum_suppression, score_similarity,
@@ -58,18 +63,26 @@ pub struct TestLevel {
 pub struct TestPyramid {
     /// Levels from full resolution upward.
     pub levels: Vec<TestLevel>,
+    /// Time to build the blurred base image and the Gaussian pyramid.
+    pub preprocess_ms: f64,
+    /// Time to compute gradients, edges, distance fields, and features.
+    pub features_ms: f64,
 }
 
 impl TestPyramid {
     /// Build the test pyramid and per-level features.
     #[must_use]
     pub fn build(image: &crate::gray::GrayF32, levels: usize, params: &FeatureParams) -> Self {
+        let preprocess_start = Instant::now();
         let base = if params.blur_sigma > 0.01 {
             image.gaussian_blur(params.blur_sigma)
         } else {
             image.clone()
         };
         let pyramid = Pyramid::build(&base, levels);
+        let preprocess_ms = duration_ms(preprocess_start);
+
+        let features_start = Instant::now();
         let levels = (0..pyramid.len())
             .map(|level| {
                 let gray = pyramid.level_unchecked(level).clone();
@@ -97,7 +110,11 @@ impl TestPyramid {
                 }
             })
             .collect();
-        Self { levels }
+        Self {
+            levels,
+            preprocess_ms,
+            features_ms: duration_ms(features_start),
+        }
     }
 
     /// A level, or `None` when out of range.
@@ -108,7 +125,7 @@ impl TestPyramid {
 }
 
 /// Search parameters for [`detect`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SearchParams {
     /// Minimum rotation in degrees.
     pub rotation_min_deg: f32,
@@ -162,6 +179,8 @@ pub struct SearchParams {
     pub score: ScoreParams,
     /// Similarity refinement parameters.
     pub refine: SimilarityRefineParams,
+    /// Homography estimation and fallback parameters.
+    pub homography: HomographyParams,
     /// NMS thresholds.
     pub nms: NmsParams,
 }
@@ -195,6 +214,7 @@ impl Default for SearchParams {
             max_detections: 10,
             score: ScoreParams::default(),
             refine: SimilarityRefineParams::default(),
+            homography: HomographyParams::default(),
             nms: NmsParams::default(),
         }
     }
@@ -217,6 +237,14 @@ impl From<SearchDefaults> for SearchParams {
                 polarity_enabled: defaults.polarity_enabled,
                 ..ScoreParams::default()
             },
+            homography: HomographyParams {
+                ransac: crate::refine::RansacParams {
+                    confidence: f64::from(defaults.ransac_confidence),
+                    seed: defaults.ransac_seed,
+                    ..crate::refine::RansacParams::default()
+                },
+                ..HomographyParams::default()
+            },
             ..Self::default()
         }
     }
@@ -238,8 +266,10 @@ pub struct Hypothesis {
 /// Stage timings in milliseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SearchTimings {
-    /// Image pyramid, gradients, edge, and feature extraction time.
+    /// Blurred base image and Gaussian pyramid construction time.
     pub preprocess_ms: f64,
+    /// Gradients, edges, distance fields, corners, and segments per level.
+    pub features_ms: f64,
     /// Hough and descriptor/segment hypothesis time.
     pub search_ms: f64,
     /// Coarse-to-fine scoring and refinement time.
@@ -249,6 +279,9 @@ pub struct SearchTimings {
 }
 
 /// Detector output.
+///
+/// Use [`crate::result::ResultsFile`] to serialize this as the versioned JSON
+/// result schema; the derived serde form here is internal.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DetectionResult {
     /// Accepted detections after NMS and thresholding.
@@ -278,9 +311,9 @@ pub fn detect(
     }
     let mut timings = SearchTimings::default();
 
-    let preprocess_start = Instant::now();
     let test = TestPyramid::build(image, 3, &model.params);
-    timings.preprocess_ms = duration_ms(preprocess_start);
+    timings.preprocess_ms = test.preprocess_ms;
+    timings.features_ms = test.features_ms;
     if test.levels.is_empty() {
         timings.total_ms = duration_ms(total_start);
         return Ok(DetectionResult {
@@ -1073,7 +1106,6 @@ fn verify_hypothesis(
     params: &SearchParams,
 ) -> Option<Detection> {
     let mut pose = hypothesis.pose;
-    let mut correspondences = 0usize;
     for level in (0..=coarse_level).rev() {
         let Some(test_level) = levels.get(level) else {
             continue;
@@ -1104,7 +1136,6 @@ fn verify_hypothesis(
             &params.score,
             &refine_params,
         );
-        correspondences = correspondences.max(refined.correspondences);
         pose = Similarity::from_pose(
             refined.pose.tx * factor,
             refined.pose.ty * factor,
@@ -1118,7 +1149,7 @@ fn verify_hypothesis(
     }
     let test_level = levels.first()?;
     let model_points = model.features_at_level(0).edges.points;
-    let score = score_similarity(
+    let similarity_score = score_similarity(
         &model_points,
         test_level.gray.width,
         test_level.gray.height,
@@ -1128,33 +1159,63 @@ fn verify_hypothesis(
         params.score.tau_d,
         &params.score,
     );
-    let homography = matrix_to_array(&pose.embed().normalized_for_output());
+
+    let roi_model = model_roi_in_model_coords(model);
+    let input = HomographyInput {
+        model_points: &model_points,
+        model_corners: &model.features.corners,
+        model_segments: &model.features.segments,
+        roi_model: &roi_model,
+        width: test_level.gray.width,
+        height: test_level.gray.height,
+        gradient: &test_level.gradient,
+        distance: &test_level.distance,
+        test_corners: &test_level.corners,
+        test_segments: &test_level.segments,
+        tau_d: params.score.tau_d,
+        score_params: &params.score,
+    };
+    let outcome = refine_homography(&input, pose, &similarity_score, &params.homography);
+
+    let (pose, homography, homography_estimated, score) = match outcome.homography {
+        Some(homography) => {
+            let local = homography.pose_at_origin()?;
+            let pose = Similarity::from_pose(local.x, local.y, local.angle, local.scale);
+            (pose, homography, true, outcome.score)
+        }
+        None => (pose, pose.embed(), false, similarity_score),
+    };
+    let fallback_reason = outcome
+        .fallback_reason
+        .map(|reason| reason.as_str().to_owned());
+    let homography = matrix_to_array(&homography.normalized_for_output());
     let diagnostics = DetectionDiagnostics {
         coverage: score.coverage,
         matched_fraction: score.matched_fraction,
         mean_distance_px: score.mean_distance,
         mean_orientation_agreement: score.mean_orientation_agreement,
         seed_source: hypothesis.source,
-        correspondences,
-        inliers: 0,
-        ransac_iterations: 0,
-        homography_estimated: false,
-        homography_condition: None,
+        correspondences: outcome.correspondences,
+        inliers: outcome.inliers,
+        ransac_iterations: outcome.ransac_iterations,
+        corner_correspondences: outcome.corner_correspondences,
+        corner_inliers: outcome.corner_inliers,
+        homography_condition: outcome.condition,
         ambiguity: 1.0,
-        fallback_reason: None,
+        fallback_reason,
     };
     Some(Detection {
         id: index,
         pose,
         homography,
-        homography_estimated: false,
+        homography_estimated,
         score: score.score,
         confidence: confidence_from(
             score.score,
             score.matched_fraction,
             score.mean_orientation_agreement,
             1.0,
-            false,
+            homography_estimated,
         ),
         diagnostics,
     })
@@ -1404,6 +1465,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let second = detect(&loaded, &scene, &params).expect("detect loaded");
         assert_eq!(first.detections, second.detections);
+    }
+
+    #[test]
+    fn similarity_scene_reports_the_similarity_fallback() {
+        let model = test_model();
+        let pose = Similarity::from_pose(140.0, 120.0, 0.6, 1.2);
+        let scene = render_scene(&model.source.as_ref().unwrap().gray, &[pose], 256, 224);
+        let params = SearchParams::from(model.search_defaults);
+        let result = detect(&model, &scene, &params).expect("detect");
+        assert!(!result.detections.is_empty());
+        for detection in &result.detections {
+            assert!(
+                !detection.homography_estimated,
+                "false perspective claim at {:?}: {:?}",
+                detection.pose, detection.diagnostics.fallback_reason
+            );
+            assert!(
+                detection.diagnostics.fallback_reason.is_some(),
+                "fallback reason missing"
+            );
+        }
     }
 
     #[test]

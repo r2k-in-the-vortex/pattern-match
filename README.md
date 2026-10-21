@@ -6,7 +6,7 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M5 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
+**Status: M6 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
 polygon and brush masks with undo/redo, live feature preview, and `.pmodel`
 save/load. Models store model-frame features, three-scale corner descriptors,
 segment-pair invariants, mask primitives, and a derived mask raster; a
@@ -15,17 +15,28 @@ R1–R5 with no `sorry`, including DLT uniqueness/degeneracy/normalization and t
 RANSAC probability, bound, success-formula, monotonicity, and iteration
 guarantees; Rust implements Hartley-normalized DLT and seeded RANSAC.
 
-The M5 detector is a hybrid similarity search: pyramid oriented Hough voting,
+The detector is a hybrid similarity search: pyramid oriented Hough voting,
 corner-descriptor and segment-pair seeding, pose clustering, edge-distance
 scoring, coarse-to-fine ICP with a score-based pattern-search fallback, and
-multi-instance NMS. Every detection currently reports the similarity embedding
-(`homography_estimated = false`); perspective evidence arrives in M6. The
-deterministic synthetic similarity benchmark reports 100% recall on clean
-16/16 scenes with worst errors 0.08 px, 0.15°, and 0.27%; 100% at 30% occlusion
-and on 50%-contrast scenes; no clutter-only false detections; and matching
-Hough-only/hybrid recall in every reported scenario. D6
-(noisy least-squares optimality) remains the documented formal follow-on. This
-document is the implementation plan and the record of decisions made.
+multi-instance NMS. Every detection reports a full 3×3 homography and a
+`homography_estimated` flag. M6 adds perspective refinement: correspondence
+assembly from edges, corners, and segment endpoints; RANSAC with
+normal-direction residuals for edges and transfer error for point features;
+robust LM interleaved with re-association; and a validation gate over depth,
+conditioning, inlier and corner support, edge-score improvement, and perspective
+stability. Rejected fits fall back to the similarity embedding with an explicit
+`fallback_reason` and reduced confidence. `result::ResultsFile` implements the
+versioned §12.3 JSON schema.
+
+The deterministic synthetic similarity benchmark reports 100% recall on clean
+16/16 scenes with worst errors 0.08 px, 0.14°, and 0.27%; 90% at 30% occlusion
+(9/10, target ≥90%) and 100% on 50%-contrast scenes; no clutter-only false
+detections; clean-scene false detections at 0.06/image; and matching
+Hough-only/hybrid recall in every reported scenario. The ≤20° tilt benchmark
+reports 100% recall (12/12), an accepted homography on every correct detection,
+and worst ROI-corner reprojection 1.21 px (target ≤1.5 px). D6 (noisy
+least-squares optimality) remains the documented formal follow-on. This document
+is the implementation plan and the record of decisions made.
 
 ---
 
@@ -216,6 +227,7 @@ pattern-match/
 │  │  │  ├─ search.rs         # Hough hypotheses, coarse-to-fine
 │  │  │  ├─ score.rs          # scoring, confidence, NMS
 │  │  │  ├─ refine.rs         # similarity ICP, RANSAC, LM homography
+│  │  │  ├─ result.rs         # versioned detection-result JSON
 │  │  │  ├─ capture.rs        # FrameSource trait, image/webcam sources
 │  │  │  └─ error.rs
 │  │  ├─ tests/
@@ -258,8 +270,9 @@ pattern-match/
 | `model` | Build model at pyramid levels, validate, save/load `.pmodel`. |
 | `geometry` | Similarity/homography algebra, DLT, normalization, pose extraction, degeneracy checks. |
 | `search` | Oriented Hough voting, peak extraction, hypothesis generation and clustering. |
-| `score` | Edge-distance/orientation scoring, coverage, confidence, pose NMS. |
-| `refine` | Similarity ICP, correspondence assembly, RANSAC, robust homography LM. |
+| `score` | Edge-distance/orientation scoring (similarity and homography), coverage, confidence, pose NMS. |
+| `refine` | Similarity ICP, correspondence assembly, RANSAC, robust homography LM, validation and fallback. |
+| `result` | Versioned detection-result JSON construction, validation, and schema conversion. |
 | `capture` | `FrameSource` trait, image-file source, webcam source (feature-gated). |
 
 ### 5.3 Dependencies
@@ -628,28 +641,36 @@ tries to upgrade each accepted candidate to an 8-DOF homography and explicitly d
 whether the evidence supports it.
 
 1. **Correspondence assembly.**
-   - Edge correspondences from the final normal-directed search (model point ↔
+   - Edge correspondences from the normal-directed search (model point ↔
      subpixel test edge point), weighted by orientation agreement and fit residual.
    - Corner correspondences: transformed model corners ↔ nearby test corners within a
-     gating radius, filtered by orientation/response compatibility.
-   - Optional segment endpoint/intersection correspondences.
+     gating radius, filtered by undirected-orientation and response compatibility.
+   - Segment endpoint correspondences, gated by endpoint distance and segment
+     orientation agreement.
 2. **RANSAC.** Sample 4 correspondences; reject samples with any three model points
    collinear (a hard geometric degeneracy); fit a homography with normalized DLT;
-   count inliers by symmetric transfer error or normal-direction residual within a
-   pixel threshold (default 2.5 px full resolution). Iteration count follows §10.3’s
-   formula, capped, with a fixed seed for reproducibility. The best model is refit on
-   all inliers.
+   count inliers within a pixel threshold (default 2.5 px full resolution) using the
+   normal-direction residual for edge correspondences and symmetric transfer error
+   for corner and segment-endpoint correspondences. The four-point degeneracy test
+   is deliberately not applied to an overdetermined refit, where straight edges
+   contribute many collinear-but-informative points. Iteration count follows the
+   conservative formula of §10.4, capped, with a fixed seed for reproducibility.
+   The best model is refit on all inliers.
 3. **Robust LM refinement.** Re-associate correspondences under the current `H` and
    minimize a robust sum of normal-direction residuals `ρ(⟨q_i - c_i, n_i'⟩)` using
    Levenberg–Marquardt on the 8 normalized homography parameters, interleaved with
    2–3 re-associations. This uses edge geometry, not just the sampled correspondences.
 4. **Validation.** Reject `H` if:
    - the determinant is near zero, a mapped ROI corner has non-positive homogeneous
-     depth, or the numerical condition number exceeds a threshold;
-   - fewer than the minimum inliers/correspondences support it;
+     depth, or the numerical condition number exceeds the threshold (default `10⁶`);
+   - fewer than the minimum inliers/correspondences support it (defaults: 6 and 12),
+     or—when both the model and the test image contain corners—fewer than 8 corner
+     inliers support it;
    - it fails to improve the §9.5 score over the similarity pose by a margin
      (default `Δscore ≥ 0.01`), or the perspective terms are not stable across
-     re-association.
+     re-association (default: relative change ≤ 0.35 between the last two rounds).
+   Candidates whose similarity score is below 0.45 are not attempted: they cannot
+   plausibly reach the default 0.55 detection threshold. The floor is configurable.
 5. **Fallback.** If rejected, the reported homography is the similarity embedding
    `H_sim`, with `homography_estimated = false` and reduced confidence. This is
    intentional: on a small, nearly fronto-parallel object an 8-DOF fit is often
@@ -687,6 +708,10 @@ Every detection reports:
 - `seed_source`: `hough`, `corner_descriptor`, or `segment_pair`.
 - `inliers`, `correspondences`, `ransac_iterations`.
 - `homography_estimated`, homography condition number, and failure reason if any.
+  Fallback reasons are stable strings: `low_similarity_score`,
+  `insufficient_correspondences`, `ransac_failed`, `ill_conditioned`,
+  `depth_behind_camera`, `score_not_improved`, `unstable_perspective`, and the
+  other variants listed by `HomographyFallbackReason`.
 - `ambiguity`: margin to the best competing detection that overlaps it.
 
 The initial `confidence` is a documented heuristic:
@@ -1018,7 +1043,10 @@ CSV export flattens one row per detection with columns:
 confidence, coverage, matched_fraction, mean_distance_px, inliers, correspondences`.
 
 The model format and results format both carry a semantic version; readers reject
-unknown major versions and ignore unknown minor fields.
+unknown major versions and ignore unknown minor fields. In `pm-core`,
+`result::ResultsFile` implements this schema: it converts the internal pose from
+radians to `angle_deg` in `(-180, 180]`, embeds the search parameters, and validates
+`format` and `version` on load. `result::DetectionRecord` is one detection row.
 
 ---
 
@@ -1188,7 +1216,10 @@ numerically.
 | NMS | zero distance < 0.35 × model diagonal, angle < 10°, scale ratio within 15%, or transformed-ROI IoU > 0.45 |
 | RANSAC sample size | 4 correspondences |
 | RANSAC confidence | 0.99; inlier threshold 2.5 px; max 5000 iterations; seed configurable |
-| Homography acceptance | score improvement ≥ 0.01; minimum 6 inliers and 12 correspondences; condition threshold documented in code |
+| Homography attempt floor | similarity score ≥ 0.45 |
+| Homography correspondences | 180 edge points, 80 corners, 40 segment endpoints; edge search ±3 px; corner/segment gates 8 px |
+| Homography LM | 20 iterations per round, 3 re-association rounds, Cauchy σ 1.5 px |
+| Homography acceptance | score improvement ≥ 0.01; minimum 6 inliers and 12 correspondences; ≥ 8 corner inliers when corners exist; matrix condition ≤ 10⁶; perspective-term relative change ≤ 0.35 |
 | Camera default | device-provided, preferably 1280×720; live processing may throttle |
 | Confidence | heuristic §9.9 until calibrated; clamped to `[0,1]` |
 

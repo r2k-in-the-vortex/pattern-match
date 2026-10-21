@@ -171,6 +171,14 @@ impl Homography {
         Self(m)
     }
 
+    /// Wrap a row-major 3×3 array, as stored in result files.
+    #[must_use]
+    pub fn from_array(m: [[f64; 3]; 3]) -> Self {
+        Self(Matrix3::new(
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+        ))
+    }
+
     /// The underlying matrix.
     #[must_use]
     pub fn matrix(&self) -> &Matrix3<f64> {
@@ -239,21 +247,86 @@ impl Homography {
         }
     }
 
+    /// The local Jacobian of the projective action at model point `p`.
+    ///
+    /// This generalizes the origin formula of the README §4: with
+    /// `w = h20·x + h21·y + h22` and `q = (h00·x + h01·y + h02,
+    /// h10·x + h11·y + h12) / w`,
+    ///
+    /// ```text
+    /// J = (1/w) · [[h00 - qx·h20, h01 - qx·h21],
+    ///              [h10 - qy·h20, h11 - qy·h21]]
+    /// ```
+    #[must_use]
+    pub fn jacobian_at(&self, p: Vector2<f64>) -> Option<Matrix2<f64>> {
+        let m = &self.0;
+        let w = m[(2, 0)] * p.x + m[(2, 1)] * p.y + m[(2, 2)];
+        if !w.is_finite() || w.abs() <= NUMERIC_EPS {
+            return None;
+        }
+        let qx = (m[(0, 0)] * p.x + m[(0, 1)] * p.y + m[(0, 2)]) / w;
+        let qy = (m[(1, 0)] * p.x + m[(1, 1)] * p.y + m[(1, 2)]) / w;
+        Some(Matrix2::new(
+            (m[(0, 0)] - qx * m[(2, 0)]) / w,
+            (m[(0, 1)] - qx * m[(2, 1)]) / w,
+            (m[(1, 0)] - qy * m[(2, 0)]) / w,
+            (m[(1, 1)] - qy * m[(2, 1)]) / w,
+        ))
+    }
+
     /// The local Jacobian of the affine action at the model origin (G8).
     #[must_use]
     pub fn jacobian_at_origin(&self) -> Option<Matrix2<f64>> {
-        let w = self.0[(2, 2)];
-        if w.abs() <= NUMERIC_EPS {
+        self.jacobian_at(Vector2::zeros())
+    }
+
+    /// Transform a model-frame unit normal to an image-frame unit normal at
+    /// model point `p` (README §9.5).
+    ///
+    /// For a homography the local normal maps by the inverse-transpose of the
+    /// local Jacobian, `n' ∝ J⁻ᵀ n`.  This is the local form of the line
+    /// transformation `l' = H⁻ᵀ l`; the returned vector is normalized, so the
+    /// caller supplies polarity separately as in the similarity path.
+    #[must_use]
+    pub fn transform_normal(&self, p: Vector2<f64>, n: Vector2<f64>) -> Option<Vector2<f64>> {
+        let jacobian = self.jacobian_at(p)?;
+        let determinant = jacobian.determinant();
+        if !determinant.is_finite() || determinant.abs() <= NUMERIC_EPS {
             return None;
         }
-        let qx = self.0[(0, 2)] / w;
-        let qy = self.0[(1, 2)] / w;
-        let mut j = Matrix2::zeros();
-        j[(0, 0)] = (self.0[(0, 0)] - qx * self.0[(2, 0)]) / w;
-        j[(0, 1)] = (self.0[(0, 1)] - qx * self.0[(2, 1)]) / w;
-        j[(1, 0)] = (self.0[(1, 0)] - qy * self.0[(2, 0)]) / w;
-        j[(1, 1)] = (self.0[(1, 1)] - qy * self.0[(2, 1)]) / w;
-        Some(j)
+        let mapped = jacobian.try_inverse()?.transpose() * n;
+        let norm = mapped.norm();
+        if !norm.is_finite() || norm <= NUMERIC_EPS {
+            None
+        } else {
+            Some(mapped / norm)
+        }
+    }
+
+    /// Numerical condition number of the matrix (ratio of largest to smallest
+    /// singular value), used by the homography validation gate (README §9.7).
+    #[must_use]
+    pub fn condition_number(&self) -> f64 {
+        let svd = self.0.svd(false, false);
+        let values = svd.singular_values;
+        let largest = values.iter().copied().fold(0.0f64, f64::max);
+        let smallest = values.iter().copied().fold(f64::INFINITY, f64::min);
+        if !largest.is_finite() || !smallest.is_finite() || smallest <= NUMERIC_EPS {
+            f64::INFINITY
+        } else {
+            largest / smallest
+        }
+    }
+
+    /// Whether every point maps to a finite point with positive homogeneous
+    /// depth.  A mapped ROI corner with non-positive depth invalidates the
+    /// homography (README §9.7).
+    #[must_use]
+    pub fn all_positive_depth(&self, points: &[Vector2<f64>]) -> bool {
+        points.iter().all(|point| {
+            let mapped = self.act_homogeneous(homogenize(*point));
+            mapped.z.is_finite() && mapped.z > NUMERIC_EPS
+        })
     }
 
     /// Report the local pose at the origin (README §4): position `q`, angle
@@ -368,8 +441,13 @@ pub fn has_degenerate_triple(points: &[Vector2<f64>]) -> bool {
 /// The source and target points are Hartley-normalized independently (D5), the
 /// 2n×9 system is solved by SVD, and the solution is denormalized and scaled for
 /// output.  The result is `None` when there are fewer than four
-/// correspondences, when either point set has a collinear triple (D4), or when
-/// the recovered matrix is numerically singular.
+/// correspondences or when the recovered matrix is numerically singular.
+///
+/// A four-point minimal sample with a collinear triple is rejected as the hard
+/// geometric degeneracy of D4.  For an overdetermined fit the collinear-triple
+/// test is deliberately not applied: a straight edge contributes many
+/// collinear points, and those points still constrain the homography jointly
+/// with the rest of the set.
 #[must_use]
 pub fn normalized_dlt(correspondences: &[(Vector2<f64>, Vector2<f64>)]) -> Option<Homography> {
     if correspondences.len() < 4 {
@@ -384,7 +462,7 @@ pub fn normalized_dlt(correspondences: &[(Vector2<f64>, Vector2<f64>)]) -> Optio
     {
         return None;
     }
-    if has_degenerate_triple(&src) || has_degenerate_triple(&dst) {
+    if correspondences.len() == 4 && (has_degenerate_triple(&src) || has_degenerate_triple(&dst)) {
         return None;
     }
     let src_norm = Normalization::from_points(&src)?;
@@ -860,6 +938,69 @@ mod tests {
         assert!(fd_close(px.y / eps, j[(1, 0)]), "G8 derivative J10");
         assert!(fd_close(py.x / eps, j[(0, 1)]), "G8 derivative J01");
         assert!(fd_close(py.y / eps, j[(1, 1)]), "G8 derivative J11");
+    }
+
+    #[test]
+    fn local_jacobian_matches_finite_differences() {
+        let h = Homography::from_matrix(Matrix3::new(
+            1.1, -0.2, 12.0, 0.3, 0.9, -7.0, 0.0008, -0.0005, 1.0,
+        ));
+        let p = Vector2::new(14.0, -9.0);
+        let j = h.jacobian_at(p).unwrap();
+        let f = |point: Vector2<f64>| h.try_act_point(point).unwrap();
+        let eps = 1e-6;
+        let px = (f(p + Vector2::new(eps, 0.0)) - f(p)) / eps;
+        let py = (f(p + Vector2::new(0.0, eps)) - f(p)) / eps;
+        assert!((px.x - j[(0, 0)]).abs() < 1e-5, "J00 {}", px.x);
+        assert!((px.y - j[(1, 0)]).abs() < 1e-5, "J10 {}", px.y);
+        assert!((py.x - j[(0, 1)]).abs() < 1e-5, "J01 {}", py.x);
+        assert!((py.y - j[(1, 1)]).abs() < 1e-5, "J11 {}", py.y);
+        let origin = h.jacobian_at(Vector2::zeros()).unwrap();
+        assert_eq!(origin, h.jacobian_at_origin().unwrap());
+    }
+
+    #[test]
+    fn homography_normal_is_perpendicular_to_the_mapped_tangent() {
+        let h = Homography::from_matrix(Matrix3::new(
+            1.2, -0.1, 4.0, 0.2, 0.8, -2.0, 0.0007, -0.0004, 1.0,
+        ));
+        let p = Vector2::new(20.0, 15.0);
+        let normal = Vector2::new(0.6, 0.8);
+        let tangent = Vector2::new(-0.8, 0.6);
+        let mapped_normal = h.transform_normal(p, normal).unwrap();
+        assert!((mapped_normal.norm() - 1.0).abs() < 1e-12);
+        let j = h.jacobian_at(p).unwrap();
+        let mapped_tangent = j * tangent;
+        assert!(
+            mapped_normal.dot(&mapped_tangent).abs() < 1e-12,
+            "normal {:?} tangent {:?}",
+            mapped_normal,
+            mapped_tangent
+        );
+    }
+
+    #[test]
+    fn condition_number_is_the_singular_value_ratio() {
+        assert!((Homography::IDENTITY.condition_number() - 1.0).abs() < 1e-12);
+        let diagonal =
+            Homography::from_matrix(Matrix3::new(2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5));
+        assert!((diagonal.condition_number() - 4.0).abs() < 1e-12);
+        let singular = Homography::from_matrix(Matrix3::zeros());
+        assert!(singular.condition_number().is_infinite());
+    }
+
+    #[test]
+    fn positive_depth_rejects_points_behind_the_camera() {
+        let h = Homography::from_matrix(Matrix3::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.01, 0.0, 1.0));
+        assert!(h.all_positive_depth(&[Vector2::new(0.0, 0.0), Vector2::new(50.0, 0.0)]));
+        assert!(!h.all_positive_depth(&[Vector2::new(-200.0, 0.0)]));
+    }
+
+    #[test]
+    fn homography_array_roundtrip() {
+        let matrix = Matrix3::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
+        let array = matrix_to_array(&matrix);
+        assert_eq!(Homography::from_array(array).matrix(), &matrix);
     }
 
     #[test]

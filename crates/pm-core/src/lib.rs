@@ -1,9 +1,9 @@
 //! `pm-core` — pattern-match algorithms and data types.
 //!
 //! The crate is independent of the UI and file dialogs. The module layout
-//! follows the architecture in the project plan (README §5.2); implementations
-//! arrive in milestones M1–M6. Modules that are still empty carry a doc comment
-//! naming their responsibility and milestone.
+//! follows the architecture in the project plan (README §5.2). Detection and
+//! model functionality through M6 is implemented; `capture` remains a stub
+//! until the webcam milestone.
 
 pub mod capture;
 pub mod corner;
@@ -19,6 +19,7 @@ pub mod model;
 pub mod overlay;
 pub mod pyramid;
 pub mod refine;
+pub mod result;
 pub mod score;
 pub mod search;
 pub mod segment;
@@ -32,7 +33,8 @@ pub use feature::{
     filter_features,
 };
 pub use geometry::{
-    Homography, RotatedRect, Similarity, ZeroFrame, has_degenerate_triple, normalized_dlt,
+    Homography, PoseEstimate, RotatedRect, Similarity, ZeroFrame, has_degenerate_triple,
+    normalized_dlt,
 };
 pub use gray::{GrayF32, LoadedImage, load_image};
 pub use image::RgbaImage;
@@ -41,12 +43,18 @@ pub use model::{HypothesisSources, Model, SearchDefaults, TeachSettings, mask_bo
 pub use overlay::{OverlayOptions, render_overlay};
 pub use pyramid::Pyramid;
 pub use refine::{
-    RansacParams, RansacResult, SimilarityRefineParams, ransac_homography, refine_similarity_level,
-    required_iterations, required_iterations_from_q,
+    Correspondence, HomographyFallbackReason, HomographyInput, HomographyOutcome, HomographyParams,
+    RansacParams, RansacResult, SimilarityRefineParams, ransac_homography,
+    ransac_homography_correspondences, refine_homography, refine_similarity_level,
+    required_iterations, required_iterations_from_q, validate_homography,
+};
+pub use result::{
+    DetectionRecord, ImageInfo, PoseRecord, RESULTS_FORMAT, RESULTS_VERSION, ResultsFile,
+    TimingsRecord,
 };
 pub use score::{
     Detection, DetectionDiagnostics, NmsParams, ScoreParams, SeedSource, confidence_from,
-    non_maximum_suppression,
+    non_maximum_suppression, score_homography, score_similarity,
 };
 pub use search::{
     DetectionResult, Hypothesis, SearchParams, SearchTimings, TestLevel, TestPyramid, detect,

@@ -1,12 +1,16 @@
-//! Deterministic synthetic similarity benchmark (README §13.3).
+//! Deterministic synthetic benchmark (README §13.3).
 //!
 //! A taught L-bracket is rendered into test scenes with known similarity
 //! poses.  The benchmark reports detection rate, position/angle/scale error,
-//! false detections, and Hough-only versus hybrid recall.
+//! false detections, and Hough-only versus hybrid recall.  The tilt scenes
+//! render the same bracket through a known perspective homography and report
+//! recall, ROI-corner reprojection error, and the fraction of correct
+//! detections that accept an estimated homography (README §13.4).
 
+use nalgebra::Matrix3;
 use pm_core::{
-    Detection, FeatureParams, GrayF32, LoadedImage, Model, RotatedRect, SearchDefaults,
-    SearchParams, TeachSettings, ZeroFrame, detect,
+    Detection, FeatureParams, GrayF32, Homography, LoadedImage, Model, RotatedRect, SearchDefaults,
+    SearchParams, Similarity, TeachSettings, ZeroFrame, detect,
 };
 
 const SCENE_WIDTH: usize = 256;
@@ -226,12 +230,105 @@ fn random_pose(rng: &mut SplitMix64, border_clip: bool) -> pm_core::geometry::Si
     pm_core::geometry::Similarity::from_pose(tx as f64, ty as f64, theta as f64, scale as f64)
 }
 
-fn matches(detection: &Detection, truth: &pm_core::geometry::Similarity) -> bool {
+fn random_tilt_base(rng: &mut SplitMix64) -> Similarity {
+    let theta = rng.range(-std::f32::consts::PI, std::f32::consts::PI);
+    let scale = rng.range(0.7, 1.6);
+    let margin = 50.0 * scale + 3.0;
+    let tx = rng.range(margin, SCENE_WIDTH as f32 - margin);
+    let ty = rng.range(margin, SCENE_HEIGHT as f32 - margin);
+    Similarity::from_pose(tx as f64, ty as f64, theta as f64, scale as f64)
+}
+
+/// A physically derived plane tilt about the model origin.
+///
+/// The camera looks down `z`; the plane basis is `R_x(tilt_x) R_y(tilt_y)`
+/// applied to the model axes and translated to distance `d`.  The focal length
+/// is chosen so the local scale at the model origin equals the base similarity
+/// scale.  Both tilt components are at most the requested magnitude.
+fn tilt_homography(
+    rng: &mut SplitMix64,
+    base: &Similarity,
+    min_deg: f32,
+    max_deg: f32,
+) -> Homography {
+    let magnitude = rng.range(min_deg, max_deg).to_radians();
+    let azimuth = rng.range(0.0, std::f32::consts::TAU);
+    let tilt_x = magnitude * azimuth.sin();
+    let tilt_y = magnitude * azimuth.cos();
+    let distance = rng.range(500.0, 800.0);
+    let cos_x = tilt_x.cos();
+    let cos_y = tilt_y.cos();
+    let focal = distance / (cos_x * cos_y).sqrt().max(1e-3);
+    let tilt = Matrix3::new(
+        f64::from(focal * cos_y),
+        0.0,
+        0.0,
+        f64::from(focal * tilt_x.sin() * tilt_y.sin()),
+        f64::from(focal * cos_x),
+        0.0,
+        f64::from(-cos_x * tilt_y.sin()),
+        f64::from(tilt_x.sin()),
+        f64::from(distance),
+    );
+    base.embed().compose(&Homography::from_matrix(tilt))
+}
+
+fn render_tilted_scene(source: &GrayF32, homography: &Homography) -> GrayF32 {
+    let inverse = homography.try_inverse().expect("truth is invertible");
+    let samples = 4usize;
+    let mut data = vec![BACKGROUND; SCENE_WIDTH * SCENE_HEIGHT];
+    for y in 0..SCENE_HEIGHT {
+        for x in 0..SCENE_WIDTH {
+            let mut sum = 0.0f32;
+            let mut object = false;
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let qx = x as f32 + (sx as f32 + 0.5) / samples as f32 - 0.5;
+                    let qy = y as f32 + (sy as f32 + 0.5) / samples as f32 - 0.5;
+                    let Some(p) =
+                        inverse.try_act_point(nalgebra::Vector2::new(f64::from(qx), f64::from(qy)))
+                    else {
+                        continue;
+                    };
+                    let value = source.sample_bilinear(p.x as f32 + ZERO[0], p.y as f32 + ZERO[1]);
+                    sum += value;
+                    object |= value > 0.3;
+                }
+            }
+            if object {
+                data[y * SCENE_WIDTH + x] = (sum / (samples * samples) as f32).max(BACKGROUND);
+            }
+        }
+    }
+    GrayF32::new(SCENE_WIDTH, SCENE_HEIGHT, data).unwrap()
+}
+
+fn pose_matches(detection: &Detection, truth: &Similarity) -> bool {
     let distance = (detection.pose.tx - truth.tx).hypot(detection.pose.ty - truth.ty);
     let angle = (detection.pose.theta - truth.theta).rem_euclid(std::f64::consts::TAU);
     let angle = angle.min(std::f64::consts::TAU - angle);
     let scale_ratio = (detection.pose.scale / truth.scale).max(truth.scale / detection.pose.scale);
     distance < 4.0 && angle < 10.0f64.to_radians() && scale_ratio < 1.1
+}
+
+fn roi_reprojection_error(
+    detection: &Detection,
+    truth: &Homography,
+    roi_model: &[[f32; 2]; 4],
+) -> f32 {
+    let detected = Homography::from_array(detection.homography);
+    roi_model
+        .iter()
+        .map(|corner| {
+            let p = nalgebra::Vector2::new(f64::from(corner[0]), f64::from(corner[1]));
+            let expected = truth.try_act_point(p);
+            let actual = detected.try_act_point(p);
+            match (expected, actual) {
+                (Some(expected), Some(actual)) => (expected - actual).norm() as f32,
+                _ => f32::INFINITY,
+            }
+        })
+        .fold(0.0f32, f32::max)
 }
 
 #[derive(Default)]
@@ -240,6 +337,8 @@ struct Metrics {
     true_positives: usize,
     false_positives: usize,
     images: usize,
+    homography_accepted: usize,
+    fallback_reason_missing: usize,
     position_errors: Vec<f32>,
     angle_errors: Vec<f32>,
     scale_errors: Vec<f32>,
@@ -255,10 +354,15 @@ impl Metrics {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| !used[*index])
-                .find(|(_, detection)| matches(detection, truth))
+                .find(|(_, detection)| pose_matches(detection, truth))
             {
                 used[index] = true;
                 self.true_positives += 1;
+                if detection.homography_estimated {
+                    self.homography_accepted += 1;
+                } else if detection.diagnostics.fallback_reason.is_none() {
+                    self.fallback_reason_missing += 1;
+                }
                 self.position_errors.push(
                     ((detection.pose.tx - truth.tx).hypot(detection.pose.ty - truth.ty)) as f32,
                 );
@@ -290,11 +394,14 @@ impl Metrics {
 
     fn report(&self, name: &str) {
         println!(
-            "{name}: recall {:.3} ({}/{}), FP/image {:.3}, max pos {:.3} px, max angle {:.3}°, max scale {:.3}%",
+            "{name}: recall {:.3} ({}/{}), FP/image {:.3}, accepted H {}, missing fallback reason {}, \
+             max pos {:.3} px, max angle {:.3}°, max scale {:.3}%",
             self.recall(),
             self.true_positives,
             self.ground_truth,
             self.false_positives_per_image(),
+            self.homography_accepted,
+            self.fallback_reason_missing,
             Self::max_or_zero(&self.position_errors),
             Self::max_or_zero(&self.angle_errors),
             Self::max_or_zero(&self.scale_errors)
@@ -321,6 +428,49 @@ fn run_scenes(
 
 #[test]
 #[ignore]
+fn diagnose_clean_homography() {
+    let model = teach_model();
+    let source = model.source.as_ref().expect("embedded source").gray.clone();
+    let params = SearchParams::from(model.search_defaults);
+    for index in 0..16 {
+        let mut rng = SplitMix64::new(1000 + index * 7919);
+        let truth = random_pose(&mut rng, false);
+        let scene = render_scene(
+            &source,
+            &[truth],
+            rng.range(0.9, 1.1),
+            rng.range(-0.03, 0.03),
+        );
+        let result = detect(&model, &scene, &params).expect("detect");
+        for detection in &result.detections {
+            let matched = pose_matches(detection, &truth);
+            println!(
+                "scene {index}: match {matched}, score {:.3}, est {}, reason {:?}, cond {:?}, \
+                 corr {}, inl {}, corner corr {}, corner inl {}, pose x {:.1} y {:.1} theta {:.3} \
+                 scale {:.3}, truth x {:.1} y {:.1} theta {:.3} scale {:.3}",
+                detection.score,
+                detection.homography_estimated,
+                detection.diagnostics.fallback_reason,
+                detection.diagnostics.homography_condition,
+                detection.diagnostics.correspondences,
+                detection.diagnostics.inliers,
+                detection.diagnostics.corner_correspondences,
+                detection.diagnostics.corner_inliers,
+                detection.pose.tx,
+                detection.pose.ty,
+                detection.pose.theta,
+                detection.pose.scale,
+                truth.tx,
+                truth.ty,
+                truth.theta,
+                truth.scale,
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
 fn diagnose_clean_errors() {
     let model = teach_model();
     let source = model.source.as_ref().expect("embedded source").gray.clone();
@@ -338,7 +488,7 @@ fn diagnose_clean_errors() {
         if let Some(detection) = result
             .detections
             .iter()
-            .find(|detection| matches(detection, &truth))
+            .find(|detection| pose_matches(detection, &truth))
         {
             let position = (detection.pose.tx - truth.tx).hypot(detection.pose.ty - truth.ty);
             let angle = (detection.pose.theta - truth.theta).rem_euclid(std::f64::consts::TAU);
@@ -367,6 +517,10 @@ fn synthetic_similarity_benchmark() {
         hybrid_clean.add(&[truth], &result.detections);
     }
     hybrid_clean.report("clean similarity hybrid");
+    assert_eq!(
+        hybrid_clean.fallback_reason_missing, 0,
+        "fallback reason missing on a clean-similarity detection"
+    );
 
     let mut hough_clean = Metrics::default();
     let hough_params = SearchParams {
@@ -496,4 +650,65 @@ fn synthetic_similarity_benchmark() {
         border.recall()
     );
     assert!(multi.recall() >= 0.9, "multi recall {:.3}", multi.recall());
+}
+
+#[test]
+fn synthetic_tilt_benchmark() {
+    let model = teach_model();
+    let source = model.source.as_ref().expect("embedded source").gray.clone();
+    let params = SearchParams::from(model.search_defaults);
+    let roi_model: [[f32; 2]; 4] = model
+        .roi
+        .corners()
+        .map(|corner| model.zero.to_model(corner));
+    let mut scenes = 0usize;
+    let mut correct = 0usize;
+    let mut accepted = 0usize;
+    let mut fallback = 0usize;
+    let mut worst_reprojection = 0.0f32;
+    let mut worst_fallback_reprojection = 0.0f32;
+
+    for index in 0..12 {
+        let mut rng = SplitMix64::new(9000 + index as u64 * 7919);
+        let base = random_tilt_base(&mut rng);
+        let truth = tilt_homography(&mut rng, &base, 8.0, 20.0);
+        let local = truth.pose_at_origin().expect("truth pose");
+        let truth_pose = Similarity::from_pose(local.x, local.y, local.angle, local.scale);
+        let scene = render_tilted_scene(&source, &truth);
+        let result = detect(&model, &scene, &params).expect("detect");
+        scenes += 1;
+        let Some(detection) = result
+            .detections
+            .iter()
+            .find(|detection| pose_matches(detection, &truth_pose))
+        else {
+            continue;
+        };
+        correct += 1;
+        let reprojection = roi_reprojection_error(detection, &truth, &roi_model);
+        if detection.homography_estimated {
+            accepted += 1;
+            worst_reprojection = worst_reprojection.max(reprojection);
+        } else {
+            fallback += 1;
+            worst_fallback_reprojection = worst_fallback_reprojection.max(reprojection);
+        }
+    }
+
+    let recall = correct as f32 / scenes as f32;
+    let accepted_fraction = accepted as f32 / correct.max(1) as f32;
+    println!(
+        "tilt ≤20°: recall {recall:.3} ({correct}/{scenes}), accepted H {accepted_fraction:.3} \
+         ({accepted}/{correct}), fallbacks {fallback}, max ROI reprojection {worst_reprojection:.3} px \
+         (fallback worst {worst_fallback_reprojection:.3} px)"
+    );
+    assert!(recall >= 0.9, "tilt recall {recall:.3}");
+    assert!(
+        accepted_fraction >= 0.8,
+        "accepted homography fraction {accepted_fraction:.3}"
+    );
+    assert!(
+        worst_reprojection <= 1.5,
+        "ROI-corner reprojection {worst_reprojection:.3} px"
+    );
 }
