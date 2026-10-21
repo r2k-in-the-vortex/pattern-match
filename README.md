@@ -6,7 +6,13 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M6 complete.** Teach mode supports a rotated ROI, zero frame, add/erase
+**Status: M7 complete.** The `pm-cli` harness implements `run`, `batch`,
+`model inspect`, and `bench synthetic` against the same `pm-core` detector used by
+the library, with versioned result JSON, CSV export, annotated overlay PNGs,
+partial parameter overrides, and deterministic seeds. The synthetic benchmark
+generator lives in `pm-core::synthetic` and is shared by the CLI and the
+integration benchmark, so reported CLI numbers and regression numbers come from
+the same scenes. Teach mode supports a rotated ROI, zero frame, add/erase
 polygon and brush masks with undo/redo, live feature preview, and `.pmodel`
 save/load. Models store model-frame features, three-scale corner descriptors,
 segment-pair invariants, mask primitives, and a derived mask raster; a
@@ -29,8 +35,8 @@ stability. Rejected fits fall back to the similarity embedding with an explicit
 versioned §12.3 JSON schema.
 
 The deterministic synthetic similarity benchmark reports 100% recall on clean
-16/16 scenes with worst errors 0.08 px, 0.14°, and 0.27%; 90% at 30% occlusion
-(9/10, target ≥90%) and 100% on 50%-contrast scenes; no clutter-only false
+16/16 scenes with worst errors 0.08 px, 0.14°, and 0.27%; 100% at 30% occlusion
+(10/10, target ≥90%) and 100% on 50%-contrast scenes; no clutter-only false
 detections; clean-scene false detections at 0.06/image; and matching
 Hough-only/hybrid recall in every reported scenario. The ≤20° tilt benchmark
 reports 100% recall (12/12), an accepted homography on every correct detection,
@@ -227,6 +233,7 @@ pattern-match/
 │  │  │  ├─ search.rs         # Hough hypotheses, coarse-to-fine
 │  │  │  ├─ score.rs          # scoring, confidence, NMS
 │  │  │  ├─ refine.rs         # similarity ICP, RANSAC, LM homography
+│  │  │  ├─ synthetic.rs      # deterministic benchmark scenes and metrics
 │  │  │  ├─ result.rs         # versioned detection-result JSON
 │  │  │  ├─ capture.rs        # FrameSource trait, image/webcam sources
 │  │  │  └─ error.rs
@@ -272,7 +279,8 @@ pattern-match/
 | `search` | Oriented Hough voting, peak extraction, hypothesis generation and clustering. |
 | `score` | Edge-distance/orientation scoring (similarity and homography), coverage, confidence, pose NMS. |
 | `refine` | Similarity ICP, correspondence assembly, RANSAC, robust homography LM, validation and fallback. |
-| `result` | Versioned detection-result JSON construction, validation, and schema conversion. |
+| `synthetic` | Deterministic synthetic scene generator and benchmark metrics shared by the CLI and tests. |
+| `result` | Versioned detection-result JSON construction, validation, CSV export, and schema conversion. |
 | `capture` | `FrameSource` trait, image-file source, webcam source (feature-gated). |
 
 ### 5.3 Dependencies
@@ -990,15 +998,33 @@ the same API.
 ### 12.2 CLI
 
 ```text
-pm-cli run   --model M.pmodel --image test.png --output results.json [--overlay out.png]
-pm-cli batch --model M.pmodel --input images/ --output-dir results/ --recursive
-pm-cli model inspect --model M.pmodel
+pm-cli run   --model M.pmodel --image test.png --output results.json
+             [--csv results.csv] [--overlay out.png] [--params params.json]
+             [--timings] [--fail-on-none]
+pm-cli batch --model M.pmodel --input images/ --output-dir results/
+             [--recursive] [--csv all.csv] [--overlay-dir overlays/]
+             [--params params.json] [--fail-on-none]
+pm-cli model inspect --model M.pmodel [--json]
 pm-cli bench synthetic --model M.pmodel [--cases 200] [--seed 42]
+             [--report report.json] [--params params.json]
 ```
 
-`run` also accepts `--params params.json` for full parameter override and `--timings`
-for stage timings. Exit code 0 means the tool ran; detections may be empty. A separate
+`--params` may be a partial or full `SearchParams` document; missing fields keep
+the model defaults, nested objects merge, unknown keys are rejected, and a result
+file's `parameters` object is accepted directly. `--timings` prints stage
+timings. `batch` mirrors the input directory structure under `--output-dir`,
+ignores non-image files, writes one JSON result per image, and includes an
+`image` column in the combined CSV. Overlay export composites the transformed
+ROI outline, zero-frame axes, and matched model edges over the display image.
+Exit code 0 means the tool ran; detections may be empty. A separate
 `--fail-on-none` flag makes empty results exit non-zero for automation.
+
+`bench synthetic` renders the model's embedded source through deterministic
+similarity, occlusion, clutter, contrast, border, multi-instance, and ≤20° tilt
+scenes. It reports recall, false detections per image, worst pose error,
+homography acceptance, and ROI-corner reprojection; `--report` writes the
+versioned `pattern-match-benchmark` v1 JSON document. The same generator and
+metrics back the integration benchmark in `crates/pm-core/tests/`.
 
 ### 12.3 Results JSON (versioned)
 
@@ -1090,6 +1116,12 @@ Since no real dataset is available yet, build a deterministic generator:
   descriptor/segment seeds.
 - **Analytic cases**: drawn L-brackets, plates with holes, and grid/checkerboard
   targets for subpixel and corner ground truth independent of the warp source.
+
+The generator and metric accumulation are implemented in `pm-core::synthetic`
+(`SyntheticRenderer`, `BenchmarkMetrics`, `run_benchmark`).  `pm-cli bench
+synthetic` drives the same code and emits a versioned report.  The integration
+regression test pins its historical scene radius and foreground gate so
+milestone-to-milestone numbers stay comparable.
 
 Metrics:
 
@@ -1244,15 +1276,3 @@ the synthetic benchmark and real images are analyzed.
 | `q` (RANSAC) | probability that one minimal sample is all-inlier |
 | `k` | RANSAC minimal sample size (4 for homography) |
 | `N` | RANSAC iterations |
-
-
-# Payments done
-USD 713.30 - Latam Airlines - Ana Padilla
-USD 713.30 - Latam Airlines - Jorge Galleguillos
-CLP 169202 - Recibo de pasaje electrónico, 27 octubre para MS ANA LUISA PADILLA GONZALEZ
-CLP 208192 - Recibo de pasaje electrónico, 27 octubre para MR JORGE FRANCISCO GALLEGUILLOS AVILES
-MXN 7254.28 - Confirmación _ Viva mexico juarez
-
-The sum is approximately MXN 33,402.
-
-

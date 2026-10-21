@@ -13,3 +13,4 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 pm-core.workspace = true
+serde_json.workspace = true

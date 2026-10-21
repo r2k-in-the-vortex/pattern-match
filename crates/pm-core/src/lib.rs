@@ -23,6 +23,7 @@ pub mod result;
 pub mod score;
 pub mod search;
 pub mod segment;
+pub mod synthetic;
 
 pub use descriptor::{
     CornerDescriptor, SegmentPairInvariant, describe_corners, segment_pair_invariants,
@@ -40,7 +41,10 @@ pub use gray::{GrayF32, LoadedImage, load_image};
 pub use image::RgbaImage;
 pub use mask::{MaskBounds, MaskPrimitive, MaskRaster};
 pub use model::{HypothesisSources, Model, SearchDefaults, TeachSettings, mask_bounds_for};
-pub use overlay::{OverlayOptions, render_overlay};
+pub use overlay::{
+    DETECTION_COLORS, DetectionOverlayOptions, MATCHED_EDGE_COLOR, OverlayOptions,
+    render_detection_overlay, render_overlay,
+};
 pub use pyramid::Pyramid;
 pub use refine::{
     Correspondence, HomographyFallbackReason, HomographyInput, HomographyOutcome, HomographyParams,
@@ -49,8 +53,8 @@ pub use refine::{
     required_iterations, required_iterations_from_q, validate_homography,
 };
 pub use result::{
-    DetectionRecord, ImageInfo, PoseRecord, RESULTS_FORMAT, RESULTS_VERSION, ResultsFile,
-    TimingsRecord,
+    DETECTION_CSV_HEADER, DetectionRecord, ImageInfo, PoseRecord, RESULTS_FORMAT, RESULTS_VERSION,
+    ResultsFile, TimingsRecord, detections_to_csv, detections_to_csv_with_images,
 };
 pub use score::{
     Detection, DetectionDiagnostics, NmsParams, ScoreParams, SeedSource, confidence_from,
@@ -58,7 +62,12 @@ pub use score::{
 };
 pub use search::{
     DetectionResult, Hypothesis, SearchParams, SearchTimings, TestLevel, TestPyramid, detect,
-    hough_hypotheses,
+    hough_hypotheses, model_roi_in_model_coords,
+};
+pub use synthetic::{
+    BENCHMARK_FORMAT, BENCHMARK_VERSION, BenchmarkMetrics, BenchmarkReport, ScenarioReport,
+    SplitMix64, SyntheticBenchParams, SyntheticRenderer, detection_matches, roi_reprojection_error,
+    run_benchmark, run_benchmark_with_params,
 };
 
 /// Version of the `pm-core` crate.

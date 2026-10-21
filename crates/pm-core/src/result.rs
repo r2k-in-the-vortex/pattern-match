@@ -182,6 +182,106 @@ impl ResultsFile {
     }
 }
 
+/// Detection CSV columns (README §12.3).
+pub const DETECTION_CSV_HEADER: &str = "id,seed_source,x,y,angle_deg,scale,h00,h01,h02,h10,h11,h12,h20,h21,h22,homography_estimated,score,confidence,coverage,matched_fraction,mean_distance_px,inliers,correspondences";
+
+/// Serialize detections as CSV rows with the README §12.3 header.
+#[must_use]
+pub fn detections_to_csv(records: &[DetectionRecord]) -> String {
+    let mut output = String::with_capacity(DETECTION_CSV_HEADER.len() + 1 + records.len() * 160);
+    output.push_str(DETECTION_CSV_HEADER);
+    output.push('\n');
+    for record in records {
+        output.push_str(&csv_row(record));
+        output.push('\n');
+    }
+    output
+}
+
+/// Serialize detections as CSV with a leading `image` column.
+///
+/// Used by `pm-cli batch`, where rows from several images share one file.
+#[must_use]
+pub fn detections_to_csv_with_images(rows: &[(&str, &DetectionRecord)]) -> String {
+    let mut output = String::with_capacity(6 + DETECTION_CSV_HEADER.len() + 1 + rows.len() * 180);
+    output.push_str("image,");
+    output.push_str(DETECTION_CSV_HEADER);
+    output.push('\n');
+    for (image, record) in rows {
+        push_csv_field(&mut output, image);
+        output.push(',');
+        output.push_str(&csv_row(record));
+        output.push('\n');
+    }
+    output
+}
+
+fn csv_row(record: &DetectionRecord) -> String {
+    let mut output = String::with_capacity(160);
+    output.push_str(&record.id.to_string());
+    output.push(',');
+    output.push_str(record.diagnostics.seed_source.as_str());
+    for value in [
+        record.pose.x,
+        record.pose.y,
+        record.pose.angle_deg,
+        record.pose.scale,
+    ] {
+        output.push(',');
+        output.push_str(&format_float(value));
+    }
+    for row in &record.homography {
+        for value in row {
+            output.push(',');
+            output.push_str(&format_float(*value));
+        }
+    }
+    output.push(',');
+    output.push_str(if record.homography_estimated {
+        "true"
+    } else {
+        "false"
+    });
+    for value in [
+        f64::from(record.score),
+        f64::from(record.confidence),
+        f64::from(record.diagnostics.coverage),
+        f64::from(record.diagnostics.matched_fraction),
+        f64::from(record.diagnostics.mean_distance_px),
+    ] {
+        output.push(',');
+        output.push_str(&format_float(value));
+    }
+    output.push(',');
+    output.push_str(&record.diagnostics.inliers.to_string());
+    output.push(',');
+    output.push_str(&record.diagnostics.correspondences.to_string());
+    output
+}
+
+fn format_float(value: f64) -> String {
+    if value == 0.0 {
+        "0".to_owned()
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+fn push_csv_field(output: &mut String, field: &str) {
+    if field.contains([',', '"', '\n', '\r']) {
+        output.push('"');
+        for character in field.chars() {
+            if character == '"' {
+                output.push('"');
+            }
+            output.push(character);
+        }
+        output.push('"');
+    } else {
+        output.push_str(field);
+    }
+}
+
 fn normalize_degrees(theta: f64) -> f64 {
     let mut degrees = theta.to_degrees().rem_euclid(360.0);
     if degrees > 180.0 {
@@ -317,6 +417,50 @@ mod tests {
         document.format = "something-else".to_owned();
         let json = serde_json::to_string(&document).expect("serialize");
         assert!(ResultsFile::from_json(&json).is_err());
+    }
+
+    #[test]
+    fn csv_export_matches_documented_columns() {
+        let params = SearchParams::default();
+        let result = sample_result(true);
+        let document = ResultsFile::new("bracket-a", 1280, 1024, &params, &result);
+        let csv = detections_to_csv(&document.detections);
+        let mut lines = csv.lines();
+        assert_eq!(lines.next(), Some(DETECTION_CSV_HEADER));
+        let row = lines.next().expect("one detection row");
+        assert!(lines.next().is_none());
+        let fields: Vec<&str> = row.split(',').collect();
+        assert_eq!(
+            fields.len(),
+            DETECTION_CSV_HEADER.split(',').count(),
+            "column count"
+        );
+        assert_eq!(fields[0], "0");
+        assert_eq!(fields[1], "hough");
+        assert_eq!(fields[2], "12.500000");
+        assert_eq!(fields[3], "-3.250000");
+        assert_eq!(fields[5], "1.150000");
+        assert_eq!(fields[15], "true");
+        assert_eq!(fields[16], "0.870000");
+        assert_eq!(fields[21], "151");
+        assert_eq!(fields[22], "184");
+    }
+
+    #[test]
+    fn csv_with_images_escapes_names() {
+        let params = SearchParams::default();
+        let result = sample_result(false);
+        let document = ResultsFile::new("bracket-a", 640, 480, &params, &result);
+        let csv = detections_to_csv_with_images(&[
+            ("plain.png", &document.detections[0]),
+            ("odd,\"name\".png", &document.detections[0]),
+        ]);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("image,"));
+        assert!(lines[1].starts_with("plain.png,0,"));
+        assert!(lines[2].starts_with("\"odd,\"\"name\"\".png\",0,"));
+        assert!(lines[1].contains(",false,"));
     }
 
     #[test]
