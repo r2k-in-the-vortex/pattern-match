@@ -1,8 +1,7 @@
 //! Non-maximum suppression, hysteresis, subpixel edge localization, and edge
 //! chaining (README §6, §7.1).
 
-use std::collections::HashSet;
-
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::feature::{EdgeChain, EdgePoint, EdgeSet};
@@ -66,8 +65,8 @@ pub fn extract_edges(gradient: &GradientField, params: &EdgeParams) -> EdgeSet {
 
     // 1. Non-maximum suppression along the gradient normal.
     let mut nms = vec![false; width * height];
-    for y in 0..height {
-        for x in 0..width {
+    nms.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+        for (x, keep) in row.iter_mut().enumerate() {
             let m0 = gradient.magnitude_at(x, y);
             if m0 <= 0.0 {
                 continue;
@@ -83,11 +82,9 @@ pub fn extract_edges(gradient: &GradientField, params: &EdgeParams) -> EdgeSet {
             let yf = y as f32;
             let m_minus = gradient.sample_magnitude(xf - nx, yf - ny);
             let m_plus = gradient.sample_magnitude(xf + nx, yf + ny);
-            if m0 >= m_minus && m0 >= m_plus && (m0 > m_minus || m0 > m_plus) {
-                nms[index] = true;
-            }
+            *keep = m0 >= m_minus && m0 >= m_plus && (m0 > m_minus || m0 > m_plus);
         }
-    }
+    });
 
     // 2. Hysteresis: strong seeds grow through weak 8-connected candidates.
     let mut candidate = vec![false; width * height];
@@ -171,33 +168,60 @@ pub fn extract_edges(gradient: &GradientField, params: &EdgeParams) -> EdgeSet {
         }
     }
 
-    // 4. 8-connected chains over accepted pixels.
-    let pixel_to_point: std::collections::HashMap<(usize, usize), usize> = pixels_by_point
-        .iter()
-        .enumerate()
-        .map(|(point, &pixel)| (pixel, point))
-        .collect();
-    let pixel_set: HashSet<(usize, usize)> = pixels_by_point.iter().copied().collect();
-    let mut visited: HashSet<(usize, usize)> = HashSet::new();
-    let mut chains = Vec::new();
-    let mut kept_indices: HashSet<usize> = HashSet::new();
-    let mut chain_id = 0u32;
+    // 4. 8-connected chains over accepted pixels.  Components are discovered
+    // with dense pixel lookups, then ordered in parallel; each component's walk
+    // is independent and the component order is preserved.
+    let mut point_at = vec![usize::MAX; width * height];
+    for (index, &(x, y)) in pixels_by_point.iter().enumerate() {
+        point_at[y * width + x] = index;
+    }
 
-    for &start in &pixels_by_point {
-        if visited.contains(&start) {
+    let mut visited = vec![false; pixels_by_point.len()];
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut frontier = Vec::new();
+    for start in 0..pixels_by_point.len() {
+        if visited[start] {
             continue;
         }
-        let ordered = order_component(start, &pixel_set, &mut visited);
+        let mut component = Vec::new();
+        visited[start] = true;
+        frontier.push(start);
+        while let Some(index) = frontier.pop() {
+            component.push(index);
+            let (x, y) = pixels_by_point[index];
+            for (dx, dy) in NEIGHBORS {
+                let nx = x as isize + dx;
+                let ny = y as isize + dy;
+                if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
+                    continue;
+                }
+                let neighbor = point_at[ny as usize * width + nx as usize];
+                if neighbor != usize::MAX && !visited[neighbor] {
+                    visited[neighbor] = true;
+                    frontier.push(neighbor);
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    let ordered_components: Vec<Vec<usize>> = components
+        .par_iter()
+        .map(|component| order_component(component, &pixels_by_point, &point_at, width, height))
+        .collect();
+
+    let mut chains = Vec::new();
+    let mut kept_flags = vec![false; points.len()];
+    let mut chain_id = 0u32;
+    for ordered in ordered_components {
         if ordered.len() < params.min_chain_length {
             continue;
         }
         let mut chain_points = Vec::with_capacity(ordered.len());
-        for pixel in ordered {
-            if let Some(&point_index) = pixel_to_point.get(&pixel) {
-                points[point_index].chain_id = chain_id;
-                chain_points.push(point_index);
-                kept_indices.insert(point_index);
-            }
+        for point_index in ordered {
+            points[point_index].chain_id = chain_id;
+            chain_points.push(point_index);
+            kept_flags[point_index] = true;
         }
         chains.push(EdgeChain {
             id: chain_id,
@@ -207,10 +231,11 @@ pub fn extract_edges(gradient: &GradientField, params: &EdgeParams) -> EdgeSet {
     }
 
     // Discard points belonging to rejected short components and remap indices.
-    let mut kept = Vec::with_capacity(kept_indices.len());
+    let kept_count = kept_flags.iter().filter(|&&kept| kept).count();
+    let mut kept = Vec::with_capacity(kept_count);
     let mut old_to_new = vec![usize::MAX; points.len()];
     for (index, point) in points.iter().enumerate() {
-        if kept_indices.contains(&index) {
+        if kept_flags[index] {
             old_to_new[index] = kept.len();
             kept.push(*point);
         }
@@ -243,65 +268,52 @@ const NEIGHBORS: [(isize, isize); 8] = [
 /// Order one 8-connected component by a greedy nearest-neighbor walk.  The walk
 /// starts at an endpoint when one exists and prefers straight continuations.
 fn order_component(
-    start: (usize, usize),
-    pixel_set: &HashSet<(usize, usize)>,
-    visited: &mut HashSet<(usize, usize)>,
-) -> Vec<(usize, usize)> {
-    let mut component = Vec::new();
-    let mut frontier = vec![start];
-    visited.insert(start);
-    while let Some(current) = frontier.pop() {
-        component.push(current);
-        for (dx, dy) in NEIGHBORS {
-            let nx = current.0 as isize + dx;
-            let ny = current.1 as isize + dy;
-            if nx < 0 || ny < 0 {
-                continue;
-            }
-            let neighbor = (nx as usize, ny as usize);
-            if pixel_set.contains(&neighbor) && visited.insert(neighbor) {
-                frontier.push(neighbor);
-            }
-        }
-    }
+    component: &[usize],
+    pixels_by_point: &[(usize, usize)],
+    point_at: &[usize],
+    width: usize,
+    height: usize,
+) -> Vec<usize> {
+    let mut component = component.to_vec();
+    component.sort_unstable_by_key(|&index| pixels_by_point[index]);
 
-    // Start from an endpoint when possible.
-    component.sort_unstable();
     let start_index = component
         .iter()
-        .position(|&p| degree(p, pixel_set) <= 1)
+        .position(|&index| degree(index, pixels_by_point, point_at, width, height) <= 1)
         .unwrap_or(0);
-    let start = component[start_index];
+    let mut current = component[start_index];
 
-    let mut in_chain: HashSet<(usize, usize)> = HashSet::new();
+    let mut in_chain = vec![false; pixels_by_point.len()];
     let mut order = Vec::with_capacity(component.len());
-    let mut current = start;
-    in_chain.insert(current);
+    in_chain[current] = true;
     order.push(current);
     let mut direction = (0.0f32, 0.0f32);
 
     loop {
-        let candidates: Vec<(usize, usize)> = NEIGHBORS
+        let (cx, cy) = pixels_by_point[current];
+        let candidates: Vec<usize> = NEIGHBORS
             .iter()
             .filter_map(|&(dx, dy)| {
-                let nx = current.0 as isize + dx;
-                let ny = current.1 as isize + dy;
-                if nx < 0 || ny < 0 {
+                let nx = cx as isize + dx;
+                let ny = cy as isize + dy;
+                if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
                     return None;
                 }
-                let candidate = (nx as usize, ny as usize);
-                (pixel_set.contains(&candidate) && !in_chain.contains(&candidate))
-                    .then_some(candidate)
+                let candidate = point_at[ny as usize * width + nx as usize];
+                (candidate != usize::MAX && !in_chain[candidate]).then_some(candidate)
             })
             .collect();
-        let Some(next) = choose_next(current, &candidates, direction) else {
+        let Some(next) = choose_next(
+            pixels_by_point[current],
+            &candidates,
+            direction,
+            pixels_by_point,
+        ) else {
             break;
         };
-        direction = (
-            next.0 as f32 - current.0 as f32,
-            next.1 as f32 - current.1 as f32,
-        );
-        in_chain.insert(next);
+        let (nx, ny) = pixels_by_point[next];
+        direction = (nx as f32 - cx as f32, ny as f32 - cy as f32);
+        in_chain[next] = true;
         order.push(next);
         current = next;
     }
@@ -309,19 +321,22 @@ fn order_component(
     // Branches or a broken greedy walk: append remaining points nearest-first so
     // no accepted edge point is silently dropped.
     while order.len() < component.len() {
-        let Some((&nearest, _)) = component
+        let (cx, cy) = pixels_by_point[current];
+        let Some(nearest) = component
             .iter()
-            .filter(|p| !in_chain.contains(p))
-            .map(|p| {
-                let dx = p.0 as f32 - current.0 as f32;
-                let dy = p.1 as f32 - current.1 as f32;
-                (p, dx * dx + dy * dy)
+            .filter(|&&index| !in_chain[index])
+            .map(|&index| {
+                let (px, py) = pixels_by_point[index];
+                let dx = px as f32 - cx as f32;
+                let dy = py as f32 - cy as f32;
+                (index, dx * dx + dy * dy)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(index, _)| index)
         else {
             break;
         };
-        in_chain.insert(nearest);
+        in_chain[nearest] = true;
         order.push(nearest);
         current = nearest;
     }
@@ -331,20 +346,25 @@ fn order_component(
 
 fn choose_next(
     current: (usize, usize),
-    candidates: &[(usize, usize)],
+    candidates: &[usize],
     direction: (f32, f32),
-) -> Option<(usize, usize)> {
+    pixels_by_point: &[(usize, usize)],
+) -> Option<usize> {
     if candidates.is_empty() {
         return None;
     }
     let dir_norm = direction.0.hypot(direction.1);
     if dir_norm <= 0.0 {
-        return candidates.iter().copied().min();
+        return candidates
+            .iter()
+            .copied()
+            .min_by_key(|&index| pixels_by_point[index]);
     }
-    candidates.iter().copied().max_by(|a, b| {
-        let score = |p: &(usize, usize)| {
-            let dx = p.0 as f32 - current.0 as f32;
-            let dy = p.1 as f32 - current.1 as f32;
+    candidates.iter().copied().max_by(|&a, &b| {
+        let score = |index: usize| {
+            let (px, py) = pixels_by_point[index];
+            let dx = px as f32 - current.0 as f32;
+            let dy = py as f32 - current.1 as f32;
             let norm = dx.hypot(dy);
             if norm <= 0.0 {
                 0.0
@@ -356,13 +376,24 @@ fn choose_next(
     })
 }
 
-fn degree(pixel: (usize, usize), pixel_set: &HashSet<(usize, usize)>) -> usize {
+fn degree(
+    index: usize,
+    pixels_by_point: &[(usize, usize)],
+    point_at: &[usize],
+    width: usize,
+    height: usize,
+) -> usize {
+    let (x, y) = pixels_by_point[index];
     NEIGHBORS
         .iter()
         .filter(|&&(dx, dy)| {
-            let nx = pixel.0 as isize + dx;
-            let ny = pixel.1 as isize + dy;
-            nx >= 0 && ny >= 0 && pixel_set.contains(&(nx as usize, ny as usize))
+            let nx = x as isize + dx;
+            let ny = y as isize + dy;
+            nx >= 0
+                && ny >= 0
+                && nx < width as isize
+                && ny < height as isize
+                && point_at[ny as usize * width + nx as usize] != usize::MAX
         })
         .count()
 }
@@ -411,36 +442,46 @@ impl DistanceField {
             }
         }
 
-        let longest = width.max(height);
-        let mut buffer = vec![0.0f32; longest];
-        let mut sites = vec![0usize; longest];
-        let mut bounds = vec![0.0f32; longest + 1];
+        let mut transposed = vec![0.0f32; width * height];
 
-        // Transform each column, then each row.
-        for x in 0..width {
-            for y in 0..height {
-                buffer[y] = squared[y * width + x];
-            }
-            edt_1d(
-                &mut buffer[..height],
-                &mut sites[..height],
-                &mut bounds[..=height],
-            );
-            for y in 0..height {
-                squared[y * width + x] = buffer[y];
-            }
-        }
-        for y in 0..height {
-            buffer[..width].copy_from_slice(&squared[y * width..(y + 1) * width]);
-            edt_1d(
-                &mut buffer[..width],
-                &mut sites[..width],
-                &mut bounds[..=width],
-            );
-            squared[y * width..(y + 1) * width].copy_from_slice(&buffer[..width]);
-        }
+        // Transform each column, then each row.  The column pass is run on a
+        // transposed buffer so both passes are contiguous row-parallel work.
+        transposed
+            .par_chunks_mut(height)
+            .enumerate()
+            .for_each(|(x, row)| {
+                for (y, value) in row.iter_mut().enumerate() {
+                    *value = squared[y * width + x];
+                }
+            });
+        transposed
+            .par_chunks_mut(height)
+            .map_init(
+                || (vec![0usize; height], vec![0.0f32; height + 1]),
+                |(sites, bounds), row| {
+                    edt_1d(row, &mut sites[..height], &mut bounds[..=height]);
+                },
+            )
+            .for_each(|_| {});
+        squared
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, value) in row.iter_mut().enumerate() {
+                    *value = transposed[x * height + y];
+                }
+            });
+        squared
+            .par_chunks_mut(width)
+            .map_init(
+                || (vec![0usize; width], vec![0.0f32; width + 1]),
+                |(sites, bounds), row| {
+                    edt_1d(row, &mut sites[..width], &mut bounds[..=width]);
+                },
+            )
+            .for_each(|_| {});
 
-        let distances = squared.into_iter().map(f32::sqrt).collect();
+        let distances = squared.into_par_iter().map(f32::sqrt).collect();
         Self {
             width,
             height,

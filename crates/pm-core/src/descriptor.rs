@@ -5,6 +5,7 @@
 //! dominant orientation.  Three descriptor radii are concatenated so later
 //! matching can compare a radius ratio (scale change) as well as shape.
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::feature::{Corner, EdgeSet, Segment};
@@ -35,7 +36,7 @@ pub struct CornerDescriptor {
 #[must_use]
 pub fn describe_corners(corners: &[Corner], edges: &EdgeSet) -> Vec<CornerDescriptor> {
     corners
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(corner_index, corner)| CornerDescriptor {
             corner_index,

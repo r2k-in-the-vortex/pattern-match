@@ -1,5 +1,7 @@
 //! Scharr gradients, magnitude, orientation, and signed polarity (README §6).
 
+use rayon::prelude::*;
+
 use crate::gray::GrayF32;
 
 /// Threshold below which a gradient is treated as zero for orientation.
@@ -35,28 +37,32 @@ impl GradientField {
         let mut gy = vec![0.0f32; width * height];
         let mut magnitude = vec![0.0f32; width * height];
 
-        for y in 0..height {
-            for x in 0..width {
-                let xi = x as isize;
+        gx.par_chunks_mut(width)
+            .zip(gy.par_chunks_mut(width))
+            .zip(magnitude.par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(y, ((gx_row, gy_row), magnitude_row))| {
                 let yi = y as isize;
-                let p = |dx: isize, dy: isize| image.at_clamped(xi + dx, yi + dy);
+                for x in 0..width {
+                    let xi = x as isize;
+                    let p = |dx: isize, dy: isize| image.at_clamped(xi + dx, yi + dy);
 
-                let gxv = (-3.0 * p(-1, -1) + 3.0 * p(1, -1) - 10.0 * p(-1, 0) + 10.0 * p(1, 0)
-                    - 3.0 * p(-1, 1)
-                    + 3.0 * p(1, 1))
-                    / 32.0;
-                let gyv = (-3.0 * p(-1, -1) - 10.0 * p(0, -1) - 3.0 * p(1, -1)
-                    + 3.0 * p(-1, 1)
-                    + 10.0 * p(0, 1)
-                    + 3.0 * p(1, 1))
-                    / 32.0;
+                    let gxv = (-3.0 * p(-1, -1) + 3.0 * p(1, -1) - 10.0 * p(-1, 0)
+                        + 10.0 * p(1, 0)
+                        - 3.0 * p(-1, 1)
+                        + 3.0 * p(1, 1))
+                        / 32.0;
+                    let gyv = (-3.0 * p(-1, -1) - 10.0 * p(0, -1) - 3.0 * p(1, -1)
+                        + 3.0 * p(-1, 1)
+                        + 10.0 * p(0, 1)
+                        + 3.0 * p(1, 1))
+                        / 32.0;
 
-                let index = y * width + x;
-                gx[index] = gxv;
-                gy[index] = gyv;
-                magnitude[index] = gxv.hypot(gyv);
-            }
-        }
+                    gx_row[x] = gxv;
+                    gy_row[x] = gyv;
+                    magnitude_row[x] = gxv.hypot(gyv);
+                }
+            });
 
         Self {
             width,

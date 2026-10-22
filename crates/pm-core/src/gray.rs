@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use image::{DynamicImage, RgbaImage};
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 
@@ -137,32 +138,35 @@ impl GrayF32 {
         }
         let kernel = gaussian_kernel(sigma);
         let radius = kernel.len() / 2;
+        let (width, height) = (self.width, self.height);
 
         let mut horizontal = vec![0.0f32; self.len()];
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let mut sum = 0.0;
-                for (k, weight) in kernel.iter().enumerate() {
-                    let sx = x as isize + k as isize - radius as isize;
-                    sum += weight * self.at_clamped(sx, y as isize);
+        horizontal
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, value) in row.iter_mut().enumerate() {
+                    let mut sum = 0.0;
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let sx = x as isize + k as isize - radius as isize;
+                        sum += weight * self.at_clamped(sx, y as isize);
+                    }
+                    *value = sum;
                 }
-                horizontal[y * self.width + x] = sum;
-            }
-        }
+            });
 
         let mut out = vec![0.0f32; self.len()];
-        for y in 0..self.height {
-            for x in 0..self.width {
+        out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+            for (x, value) in row.iter_mut().enumerate() {
                 let mut sum = 0.0;
                 for (k, weight) in kernel.iter().enumerate() {
                     let sy = y as isize + k as isize - radius as isize;
-                    sum += weight
-                        * horizontal
-                            [sy.clamp(0, self.height as isize - 1) as usize * self.width + x];
+                    sum +=
+                        weight * horizontal[sy.clamp(0, height as isize - 1) as usize * width + x];
                 }
-                out[y * self.width + x] = sum;
+                *value = sum;
             }
-        }
+        });
         Self {
             width: self.width,
             height: self.height,

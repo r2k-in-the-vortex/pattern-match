@@ -162,39 +162,45 @@ impl TestPyramid {
 
         let features_start = Instant::now();
         let level_count = pyramid.len().max(1);
-        let mut built = Vec::with_capacity(pyramid.len());
-        for level in 0..pyramid.len() {
-            if progress.cancelled() {
-                return Err(Error::Cancelled);
-            }
-            let gray = pyramid.level_unchecked(level).clone();
-            let gradient = GradientField::compute(&gray);
-            let edges = extract_edges(&gradient, &params.edge);
-            let distance = DistanceField::from_edges(&edges, gray.width, gray.height);
-            let corners = if params.detect_corners {
-                detect_corners(&gradient, &params.corner)
-            } else {
-                Vec::new()
-            };
-            let segments = if params.fit_segments {
-                fit_segments(&edges, &params.segment)
-            } else {
-                Vec::new()
-            };
-            built.push(TestLevel {
-                level,
-                gray,
-                gradient,
-                edges,
-                distance,
-                corners,
-                segments,
-            });
-            progress.progress(
-                DetectStage::Edges,
-                0.02 + 0.28 * (level + 1) as f32 / level_count as f32,
-            );
+        let built: Vec<Option<TestLevel>> = (0..pyramid.len())
+            .into_par_iter()
+            .map(|level| {
+                if progress.cancelled() {
+                    return None;
+                }
+                let gray = pyramid.level_unchecked(level).clone();
+                let gradient = GradientField::compute(&gray);
+                let edges = extract_edges(&gradient, &params.edge);
+                let distance = DistanceField::from_edges(&edges, gray.width, gray.height);
+                let corners = if params.detect_corners {
+                    detect_corners(&gradient, &params.corner)
+                } else {
+                    Vec::new()
+                };
+                let segments = if params.fit_segments {
+                    fit_segments(&edges, &params.segment)
+                } else {
+                    Vec::new()
+                };
+                progress.progress(
+                    DetectStage::Edges,
+                    0.02 + 0.28 * (level + 1) as f32 / level_count as f32,
+                );
+                Some(TestLevel {
+                    level,
+                    gray,
+                    gradient,
+                    edges,
+                    distance,
+                    corners,
+                    segments,
+                })
+            })
+            .collect();
+        if built.iter().any(Option::is_none) {
+            return Err(Error::Cancelled);
         }
+        let built: Vec<TestLevel> = built.into_iter().flatten().collect();
         Ok(Self {
             levels: built,
             preprocess_ms,
