@@ -1241,6 +1241,29 @@ The CLI `--timings` flag and a UI stage timer expose the same data. Optimization
 after correctness: coarse-level work reduction, distance-transform reuse, hypothesis
 pruning, and parallel reductions. GPU acceleration is explicitly future work.
 
+Work in progress on improvements:
+
+- Hough is memory-traffic bound, not arithmetic bound; vectorizing the 20% scan cannot fix the 52% allocation/zero and 28% scattered writes.
+- Blur is memory/allocation/rayon-bound at 1024²; the vector kernel itself is faster only for the larger σ, and that gain disappears in the full pipeline.
+- The remaining refine stage (~31 ms) is gather-heavy (bilinear EDT/gradient samples per model point); AVX2 gather is available but slow, and the stage is already parallel over candidates.
+- Features are down to ~39 ms and already parallel; descriptors ~8 ms and segments ~3 ms are not worth vectorizing.
+
+Recommendation
+
+SIMD is not the lever for the remaining 180 ms. I removed the SIMD code and the pulp/wide direct dependencies; the tree is back to your committed parallelization state (e24db8f), with detections bit-identical and 136 unit + bracket + synthetic benchmark tests passing.
+
+The path to lower latency is algorithmic:
+
+1. Hough memory traffic — **implemented**: per-scale accumulator margins, scan/reset limited to each scale's voted bounding box, and a per-rotation gated vote list reused one cache-resident accumulator at a time. Measured ~93 → 26–30 ms, below the 40–50 ms estimate.
+2. Coarse pose count — 60 rotations × 12 scales = 720 bins. Coarse-to-fine angular/scale refinement or fewer bins would cut the dominant cost; this is what Cognex-class implementations do.
+3. Refine — profile/trim RANSAC and LM iterations (~31 ms).
+4. Skip unused pyramid level — the coarse level is 2 but L3 features are still extracted (~3 ms).
+5. If SIMD is revisited later, the only clean compute-bound targets are descriptor L1 distance (~2–4 ms) and gradient (~1–2 ms); not worth the dependency complexity now.
+
+Final release timing on this machine: 168.6–182.7 ms across five runs (~177 ms median), down from ~420 ms before parallelization.
+
+After recommendation 1: Hough 26–30 ms (three runs) and end-to-end 112–120 ms (~117 ms median), with detections bit-identical to the pre-change baseline on the bracket and single-instance fixtures; 136 unit, bracket, golden, and synthetic benchmark tests pass.
+
 ---
 
 ## 14. Milestones

@@ -687,11 +687,23 @@ fn hough_hypotheses_with_progress(
         .iter()
         .map(|point| (point.x * point.x + point.y * point.y).sqrt())
         .fold(0.0f32, f32::max);
-    let margin = (max_radius * params.scale_max.max(1.0)).ceil() as i32
-        + (params.orientation_gate * 2.0).ceil() as i32;
-    let accumulator_width = width as i32 + 2 * margin;
-    let accumulator_height = height as i32 + 2 * margin;
-    if accumulator_width <= 0 || accumulator_height <= 0 {
+    let gate_margin = (params.orientation_gate * 2.0).ceil() as i32;
+
+    // A scale's votes reach at most `max_radius * scale` from the test point,
+    // so each scale gets only the margin it needs.  That shrinks both the
+    // reset (allocation/zero) and the peak scan, which dominate Hough cost.
+    let layout: Vec<(i32, i32, i32)> = scales
+        .iter()
+        .map(|&scale| {
+            let margin = (max_radius * scale).ceil() as i32 + gate_margin;
+            (
+                margin,
+                width as i32 + 2 * margin,
+                height as i32 + 2 * margin,
+            )
+        })
+        .collect();
+    if layout.iter().any(|&(_, w, h)| w <= 2 || h <= 2) {
         return Vec::new();
     }
 
@@ -720,129 +732,282 @@ fn hough_hypotheses_with_progress(
             (point.ny * sign).atan2(point.nx * sign)
         })
         .collect();
-    let scale_count = scales.len();
-    let accumulator_size = accumulator_width as usize * accumulator_height as usize;
     let completed = AtomicUsize::new(0);
     let total_rotations = rotations.len().max(1);
+    let max_accumulator_size = layout
+        .iter()
+        .map(|&(_, width, height)| width as usize * height as usize)
+        .max()
+        .unwrap_or(0);
 
     let per_rotation: Vec<Vec<Hypothesis>> = rotations
         .par_iter()
-        .map(|&theta| {
-            if progress.cancelled() {
-                return Vec::new();
-            }
-            let (sin, cos) = theta.sin_cos();
-            let mut accumulators = vec![vec![0.0f32; accumulator_size]; scale_count];
-            let mut maxima = vec![0.0f32; scale_count];
-            for (test_index, test_point) in test_points.iter().enumerate() {
-                if test_index % 256 == 0 && progress.cancelled() {
+        .map_init(
+            || HoughScratch::new(max_accumulator_size),
+            |scratch, &theta| {
+                if progress.cancelled() {
                     return Vec::new();
                 }
-                let test_angle = test_angles[test_index];
-                let target = (test_angle - theta).rem_euclid(std::f32::consts::TAU);
-                let center = (target / bucket_width).floor() as i32;
-                for bucket_offset in -reach..=reach {
-                    let bucket =
-                        (center + bucket_offset).rem_euclid(orientation_buckets as i32) as usize;
-                    for &model_index in &buckets[bucket] {
-                        let model_point = &model_points[model_index];
-                        let difference = wrap_angle(test_angle - model_angles[model_index] - theta);
-                        if difference.abs() > gate {
-                            continue;
-                        }
-                        let kernel = 0.5 + 0.5 * (std::f32::consts::PI * difference / gate).cos();
-                        let weight =
-                            model_point.weight.max(0.0) * test_point.weight.max(1e-3) * kernel;
-                        if weight <= 0.0 {
-                            continue;
-                        }
-                        let rotated_x = cos * model_point.x - sin * model_point.y;
-                        let rotated_y = sin * model_point.x + cos * model_point.y;
-                        for (scale_index, &scale) in scales.iter().enumerate() {
-                            let vote_x = test_point.x - scale * rotated_x;
-                            let vote_y = test_point.y - scale * rotated_y;
-                            let x = (vote_x + margin as f32).round() as i32;
-                            let y = (vote_y + margin as f32).round() as i32;
-                            if x < 0 || y < 0 || x >= accumulator_width || y >= accumulator_height {
+                let (sin, cos) = theta.sin_cos();
+                let HoughScratch {
+                    accumulator,
+                    entries,
+                } = scratch;
+                entries.clear();
+
+                // Pass 1: resolve the orientation gate once per rotation and
+                // remember the votes that survive it.  The vote order is the
+                // same as the original nested loops, so each accumulator cell
+                // sums its weights in the same order.
+                for (test_index, test_point) in test_points.iter().enumerate() {
+                    if test_index % 256 == 0 && progress.cancelled() {
+                        return Vec::new();
+                    }
+                    let test_angle = test_angles[test_index];
+                    let test_weight = test_point.weight.max(1e-3);
+                    let target = (test_angle - theta).rem_euclid(std::f32::consts::TAU);
+                    let center = (target / bucket_width).floor() as i32;
+                    for bucket_offset in -reach..=reach {
+                        let bucket = (center + bucket_offset).rem_euclid(orientation_buckets as i32)
+                            as usize;
+                        for &model_index in &buckets[bucket] {
+                            let model_point = &model_points[model_index];
+                            let difference =
+                                wrap_angle(test_angle - model_angles[model_index] - theta);
+                            if difference.abs() > gate {
                                 continue;
                             }
-                            let index = y as usize * accumulator_width as usize + x as usize;
-                            accumulators[scale_index][index] += weight;
-                            maxima[scale_index] =
-                                maxima[scale_index].max(accumulators[scale_index][index]);
+                            let kernel =
+                                0.5 + 0.5 * (std::f32::consts::PI * difference / gate).cos();
+                            let weight = model_point.weight.max(0.0) * test_weight * kernel;
+                            if weight <= 0.0 {
+                                continue;
+                            }
+                            entries.push(VoteEntry {
+                                test_index: test_index as u32,
+                                rotated_x: cos * model_point.x - sin * model_point.y,
+                                rotated_y: sin * model_point.x + cos * model_point.y,
+                                weight,
+                            });
                         }
                     }
                 }
-            }
 
-            let mut found = Vec::new();
-            for (scale_index, &scale) in scales.iter().enumerate() {
-                let maximum = maxima[scale_index];
-                if maximum <= 0.0 {
-                    continue;
-                }
-                let threshold = maximum * params.peak_fraction.clamp(0.0, 1.0);
-                let values = &accumulators[scale_index];
-                let mut peaks = Vec::new();
-                for y in 1..accumulator_height - 1 {
-                    for x in 1..accumulator_width - 1 {
-                        let index = y as usize * accumulator_width as usize + x as usize;
-                        let value = values[index];
-                        if value < threshold {
+                // Pass 2: accumulate and scan one scale at a time with a
+                // single reusable grid.  Every scale's working set fits in
+                // cache instead of twelve grids competing for L2/L3.
+                let mut found = Vec::new();
+                for (scale_index, &scale) in scales.iter().enumerate() {
+                    let (margin, width, height) = layout[scale_index];
+                    accumulator.configure(margin, width, height);
+                    for entry in entries.iter() {
+                        let test_point = &test_points[entry.test_index as usize];
+                        let vote_x = test_point.x - scale * entry.rotated_x;
+                        let vote_y = test_point.y - scale * entry.rotated_y;
+                        let x = (vote_x + margin as f32).round() as i32;
+                        let y = (vote_y + margin as f32).round() as i32;
+                        if x < 0 || y < 0 || x >= width || y >= height {
                             continue;
                         }
-                        let mut local_max = true;
-                        for dy in -1..=1 {
-                            for dx in -1..=1 {
-                                if dx == 0 && dy == 0 {
-                                    continue;
-                                }
-                                let neighbour = (y + dy) as usize * accumulator_width as usize
-                                    + (x + dx) as usize;
-                                if values[neighbour] > value {
-                                    local_max = false;
-                                }
+                        accumulator.vote(x, y, entry.weight);
+                    }
+                    let maximum = accumulator.maximum;
+                    if maximum > 0.0 {
+                        let threshold = maximum * params.peak_fraction.clamp(0.0, 1.0);
+                        let mut peaks = accumulator.peaks(threshold);
+                        peaks.sort_by(|a, b| {
+                            b.0.total_cmp(&a.0)
+                                .then_with(|| a.2.cmp(&b.2))
+                                .then_with(|| a.1.cmp(&b.1))
+                        });
+                        for &(value, x, y) in peaks.iter().take(params.peaks_per_bin.max(1)) {
+                            let translation_x = (x - margin) as f64;
+                            let translation_y = (y - margin) as f64;
+                            let factor = (1u32 << level_index) as f64;
+                            let pose = Similarity::from_pose(
+                                translation_x * factor,
+                                translation_y * factor,
+                                f64::from(theta),
+                                f64::from(scale),
+                            );
+                            if is_in_search_region(params.search_region, pose.tx, pose.ty) {
+                                found.push(Hypothesis {
+                                    pose,
+                                    seed_score: value,
+                                    source: SeedSource::Hough,
+                                    level: level_index,
+                                });
                             }
                         }
-                        if local_max {
-                            peaks.push((value, x, y));
-                        }
                     }
+                    accumulator.reset();
                 }
-                peaks.sort_by(|a, b| {
-                    b.0.total_cmp(&a.0)
-                        .then_with(|| a.2.cmp(&b.2))
-                        .then_with(|| a.1.cmp(&b.1))
-                });
-                for &(value, x, y) in peaks.iter().take(params.peaks_per_bin.max(1)) {
-                    let translation_x = (x - margin) as f64;
-                    let translation_y = (y - margin) as f64;
-                    let factor = (1u32 << level_index) as f64;
-                    let pose = Similarity::from_pose(
-                        translation_x * factor,
-                        translation_y * factor,
-                        f64::from(theta),
-                        f64::from(scale),
-                    );
-                    if is_in_search_region(params.search_region, pose.tx, pose.ty) {
-                        found.push(Hypothesis {
-                            pose,
-                            seed_score: value,
-                            source: SeedSource::Hough,
-                            level: level_index,
-                        });
-                    }
-                }
-            }
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            progress.progress(
-                DetectStage::Search,
-                0.30 + 0.12 * done as f32 / total_rotations as f32,
-            );
-            found
-        })
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                progress.progress(
+                    DetectStage::Search,
+                    0.30 + 0.12 * done as f32 / total_rotations as f32,
+                );
+                found
+            },
+        )
         .collect();
     per_rotation.into_iter().flatten().collect()
+}
+
+/// One qualifying vote in a rotation's orientation-gated list.
+#[derive(Clone, Copy)]
+struct VoteEntry {
+    test_index: u32,
+    rotated_x: f32,
+    rotated_y: f32,
+    weight: f32,
+}
+
+/// Per-worker Hough scratch: the gated vote list and one reusable grid.
+struct HoughScratch {
+    accumulator: HoughAccumulator,
+    entries: Vec<VoteEntry>,
+}
+
+impl HoughScratch {
+    fn new(accumulator_size: usize) -> Self {
+        Self {
+            accumulator: HoughAccumulator::new(accumulator_size),
+            entries: Vec::with_capacity(4096),
+        }
+    }
+}
+
+/// A Hough accumulator grid, reused across scales by a rotation worker.
+///
+/// The grid is reconfigured per scale: the margin covers that scale's maximum
+/// vote reach, so scales use smaller grids than the worst-case (`scale_max`)
+/// margin would require.  The voted bounding box drives the peak scan and the
+/// reset, which touch only cells that can hold a vote.
+struct HoughAccumulator {
+    margin: i32,
+    width: i32,
+    height: i32,
+    values: Vec<f32>,
+    maximum: f32,
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+}
+
+impl HoughAccumulator {
+    fn new(capacity: usize) -> Self {
+        Self {
+            margin: 0,
+            width: 0,
+            height: 0,
+            values: vec![0.0; capacity],
+            maximum: 0.0,
+            min_x: i32::MAX,
+            max_x: i32::MIN,
+            min_y: i32::MAX,
+            max_y: i32::MIN,
+        }
+    }
+
+    /// Point the accumulator at another scale's grid.
+    ///
+    /// The buffer is shared across scales and is already zero because the
+    /// previous scale's [`Self::reset`] cleared every cell it voted into.
+    fn configure(&mut self, margin: i32, width: i32, height: i32) {
+        debug_assert!(width as usize * height as usize <= self.values.len());
+        self.margin = margin;
+        self.width = width;
+        self.height = height;
+    }
+
+    /// Add `weight` to a cell and extend the voted bounding box.
+    #[inline]
+    fn vote(&mut self, x: i32, y: i32, weight: f32) {
+        let index = y as usize * self.width as usize + x as usize;
+        let value = self.values[index] + weight;
+        self.values[index] = value;
+        if value > self.maximum {
+            self.maximum = value;
+        }
+        self.min_x = self.min_x.min(x);
+        self.max_x = self.max_x.max(x);
+        self.min_y = self.min_y.min(y);
+        self.max_y = self.max_y.max(y);
+    }
+
+    /// Restore the accumulator to all zeros for the next scale.
+    ///
+    /// Every non-zero cell is inside the voted bounding box, so clearing the
+    /// box is enough; margins that no vote reached are already zero.
+    fn reset(&mut self) {
+        if self.min_x <= self.max_x && self.min_y <= self.max_y {
+            let width = self.width as usize;
+            for y in self.min_y..=self.max_y {
+                let start = y as usize * width + self.min_x as usize;
+                let end = y as usize * width + self.max_x as usize + 1;
+                self.values[start..end].fill(0.0);
+            }
+        }
+        self.maximum = 0.0;
+        self.min_x = i32::MAX;
+        self.max_x = i32::MIN;
+        self.min_y = i32::MAX;
+        self.max_y = i32::MIN;
+    }
+
+    /// Local maxima at or above `threshold`, in raster order.
+    ///
+    /// Only the voted bounding box expanded by one cell can contain a
+    /// qualifying peak, because every cell outside it is zero.  A zero
+    /// threshold makes every cell a candidate, so the full interior is
+    /// scanned to preserve the previous behaviour.
+    fn peaks(&self, threshold: f32) -> Vec<(f32, i32, i32)> {
+        let mut peaks = Vec::new();
+        if self.maximum <= 0.0 {
+            return peaks;
+        }
+        let (x0, x1, y0, y1) = if threshold <= 0.0 {
+            (1, self.width - 2, 1, self.height - 2)
+        } else {
+            (
+                (self.min_x - 1).max(1),
+                (self.max_x + 1).min(self.width - 2),
+                (self.min_y - 1).max(1),
+                (self.max_y + 1).min(self.height - 2),
+            )
+        };
+        if x0 > x1 || y0 > y1 {
+            return peaks;
+        }
+        let width = self.width as usize;
+        for y in y0..=y1 {
+            let row = y as usize * width;
+            let above = row - width;
+            let below = row + width;
+            for x in x0..=x1 {
+                let column = x as usize;
+                let index = row + column;
+                let value = self.values[index];
+                if value < threshold {
+                    continue;
+                }
+                let local_max = self.values[above + column - 1] <= value
+                    && self.values[above + column] <= value
+                    && self.values[above + column + 1] <= value
+                    && self.values[row + column - 1] <= value
+                    && self.values[row + column + 1] <= value
+                    && self.values[below + column - 1] <= value
+                    && self.values[below + column] <= value
+                    && self.values[below + column + 1] <= value;
+                if local_max {
+                    peaks.push((value, x, y));
+                }
+            }
+        }
+        peaks
+    }
 }
 
 /// Corner-descriptor seeding (README §9.3).
@@ -1862,5 +2027,71 @@ mod tests {
             matches!(result, Err(Error::Cancelled)),
             "expected cancellation, got {result:?}"
         );
+    }
+
+    /// Reference peak scan over the whole accumulator interior.
+    fn full_scan_peaks(
+        values: &[f32],
+        width: usize,
+        height: usize,
+        threshold: f32,
+    ) -> Vec<(f32, i32, i32)> {
+        let mut peaks = Vec::new();
+        for y in 1..height - 1 {
+            for x in 1..width - 1 {
+                let value = values[y * width + x];
+                if value < threshold {
+                    continue;
+                }
+                let mut local_max = true;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let neighbour = (y as i32 + dy) as usize * width + (x as i32 + dx) as usize;
+                        if values[neighbour] > value {
+                            local_max = false;
+                        }
+                    }
+                }
+                if local_max {
+                    peaks.push((value, x as i32, y as i32));
+                }
+            }
+        }
+        peaks
+    }
+
+    #[test]
+    fn hough_accumulator_bbox_scan_matches_full_scan() {
+        let mut accumulator = HoughAccumulator::new(32 * 32);
+        accumulator.configure(0, 32, 32);
+        for &(x, y, weight) in &[
+            (10, 10, 1.0f32),
+            (11, 10, 0.5),
+            (10, 11, 0.5),
+            (11, 11, 0.25),
+            (20, 20, 2.0),
+            (21, 20, 0.5),
+            (25, 5, 0.75),
+        ] {
+            accumulator.vote(x, y, weight);
+        }
+        assert_eq!(
+            accumulator.peaks(0.5),
+            full_scan_peaks(&accumulator.values, 32, 32, 0.5)
+        );
+    }
+
+    #[test]
+    fn hough_accumulator_reset_clears_votes() {
+        let mut accumulator = HoughAccumulator::new(16 * 16);
+        accumulator.configure(2, 16, 16);
+        accumulator.vote(5, 6, 1.0);
+        accumulator.vote(7, 9, 2.0);
+        accumulator.reset();
+        assert!(accumulator.values.iter().all(|&value| value == 0.0));
+        assert_eq!(accumulator.maximum, 0.0);
     }
 }
