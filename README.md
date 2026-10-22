@@ -1266,7 +1266,7 @@ Work in progress on improvements:
 
 - Hough is memory-traffic bound, not arithmetic bound; vectorizing the 20% scan cannot fix the 52% allocation/zero and 28% scattered writes.
 - Blur is memory/allocation/rayon-bound at 1024²; the vector kernel itself is faster only for the larger σ, and that gain disappears in the full pipeline.
-- The remaining refine stage (~31 ms) is gather-heavy (bilinear EDT/gradient samples per model point); AVX2 gather is available but slow, and the stage is already parallel over candidates.
+- The refine stage is not RANSAC/LM-bound: homography estimation totals ~11 ms across all 24 verified candidates. It is dominated by the pyramid similarity refinement, where pattern-search scoring is ~60% and ICP normal-directed scans ~40%. Pattern search evaluates ~60 scores per hypothesis per level, each over every model point; the score loop's bilinear EDT/gradient samples are the lever, and AVX2 gather is not (it is slow, and the stage is already parallel over candidates).
 - Features are down to ~39 ms and already parallel; descriptors ~8 ms and segments ~3 ms are not worth vectorizing.
 
 Recommendation
@@ -1277,7 +1277,7 @@ The path to lower latency is algorithmic:
 
 1. Hough memory traffic — **implemented**: per-scale accumulator margins, scan/reset limited to each scale's voted bounding box, and a per-rotation gated vote list reused one cache-resident accumulator at a time. Measured ~93 → 26–30 ms, below the 40–50 ms estimate. -70% improvement for Hough achieved.
 2. Coarse pose count — **implemented (orientation gate + bucket reach)**: the gate narrowed from 0.20 to 0.08 rad, so the gate window spans ~1.5 rotation steps instead of nearly four and each test/model pair votes in far fewer bins.  The orientation-bucket scan also dropped an unnecessary bucket per side: `reach = floor(gate / bucket_width) + 1` provably covers every angle inside the gate.  Isolated Hough fell 26.7 → 14.2 ms (median of 7 runs; −47%), and the full `pm-core` suite passes. Fewer bins themselves are at an accuracy floor: 50 rotations and 11 scale bins make a pure-similarity scene claim a spurious homography, and 30 rotations lose a bracket instance. Coarse-to-fine refinement would have to move inside the Hough stage (e.g. estimating scale from each peak's vote pairs); widening the coarse ICP radius recovered rotation-coarse poses but not scale-coarse ones.  A lossless spatial coarse-to-fine prototype (half- and quarter-resolution translation accumulators refined by the pyramid) saved only 6–9%: the vote loop is throughput-bound, not cache-bound, so fewer votes are the only lever that moves Hough time significantly. Because the narrower gate is a real (if small) recall trade — 87.5% vs 91.5% on the 200-case clean-similarity sweep for the Bracket model, while the pinned acceptance benchmark keeps 100% recall in every scenario — a **High accuracy** option (UI checkbox or `--high-accuracy`) restores the 0.20 rad gate, and the default keeps the speed optimization.
-3. Refine — profile/trim RANSAC and LM iterations (~31 ms).
+3. Refine — **implemented (capped pattern-search ranking + exponent fast path)**: RANSAC/LM were not the cost. Candidate ranking inside the pattern search now scores a deterministic uniform stride of at most 1024 model points instead of every point, and the scoring kernel evaluates the common integer orientation exponents without `powf`. Refine fell 27.3 → 17.6 ms (median of 10 interleaved CLI runs; −36%) and end-to-end fell 97.5 → 89.1 ms, with the 200-case synthetic sweep bit-identical in every scenario metric.
 4. Skip unused pyramid level — the coarse level is 2 but L3 features are still extracted (~3 ms).
 5. If SIMD is revisited later, the only clean compute-bound targets are descriptor L1 distance (~2–4 ms) and gradient (~1–2 ms); not worth the dependency complexity now.
 
@@ -1286,6 +1286,8 @@ Final release timing on this machine: 168.6–182.7 ms across five runs (~177 ms
 After recommendation 1: Hough 26–30 ms (three runs) and end-to-end 112–120 ms (~117 ms median), with detections bit-identical to the pre-change baseline on the bracket and single-instance fixtures; 136 unit, bracket, golden, and synthetic benchmark tests pass.
 
 After recommendation 2: Hough 14.2 ms (isolated median of 7 runs, 12.5–14.8 ms) and end-to-end 98.8–108.9 ms (~102.6 ms median across 7 runs), down from ~117 ms after recommendation 1.  The six bracket instances are still detected, each within 0.1 px of its previous position; 139 unit, 5 CLI, bracket, golden, and synthetic benchmark tests pass.  The High accuracy option restores Hough 24.5 ms and end-to-end ~116.8 ms.
+
+After recommendation 3: refine 16.9–17.9 ms (median 17.6) and end-to-end 86.6–92.0 ms (median ~89.1) across 10 interleaved runs of the optimized and pre-change CLI on the same machine; the pre-change binary measured refine 26.2–28.8 ms and total 95.5–103.9 ms (median 97.5).  The 200-case synthetic sweep reports identical recall, false positives, pose errors, homography acceptance, and reprojection error before and after.  Large-model poses move at most ~0.03 px / 0.04° when the 1024-point ranking cap engages (Bracket, six instances); a 512-point cap was rejected because it shifted one instance by ~0.2 px.  All 139 unit, bracket, golden, and synthetic benchmark tests pass.
 
 ---
 

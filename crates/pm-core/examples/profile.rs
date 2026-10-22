@@ -200,6 +200,17 @@ fn main() {
         result.hypotheses_scored
     );
     eprintln!("detections: {}", result.detections.len());
+    for detection in &result.detections {
+        eprintln!(
+            "det tx={:.4} ty={:.4} theta={:.6} scale={:.6} score={:.4} hom={}",
+            detection.pose.tx,
+            detection.pose.ty,
+            detection.pose.theta,
+            detection.pose.scale,
+            detection.score,
+            detection.homography_estimated
+        );
+    }
 
     // Parameter sweeps to attribute Hough cost.
     eprintln!("Hough parameter sweep:");

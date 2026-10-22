@@ -142,7 +142,7 @@ pub fn score_similarity(
         };
         let edge_distance = f64::from(distance.sample(q.x as f32, q.y as f32));
         let proximity = (1.0 - edge_distance / f64::from(tau_d)).max(0.0);
-        let quality = weight * proximity * agreement.powf(power) * reliability;
+        let quality = weight * proximity * orientation_power_value(agreement, power) * reliability;
         quality_sum += quality;
         orientation_sum += weight * agreement * reliability;
         if quality > 0.0 {
@@ -159,6 +159,19 @@ pub fn score_similarity(
         distance_sum,
         orientation_sum,
     )
+}
+
+/// `agreement^power`, with the common integer exponents handled directly.
+fn orientation_power_value(agreement: f64, power: f64) -> f64 {
+    if power == 2.0 {
+        agreement * agreement
+    } else if power == 1.0 {
+        agreement
+    } else if power == 0.0 {
+        1.0
+    } else {
+        agreement.powf(power)
+    }
 }
 
 /// Score a homography against one test level (README §9.5, §9.7).
@@ -227,7 +240,7 @@ pub fn score_homography(
         };
         let edge_distance = f64::from(distance.sample(q.x as f32, q.y as f32));
         let proximity = (1.0 - edge_distance / f64::from(tau_d)).max(0.0);
-        let quality = weight * proximity * agreement.powf(power) * reliability;
+        let quality = weight * proximity * orientation_power_value(agreement, power) * reliability;
         quality_sum += quality;
         orientation_sum += weight * agreement * reliability;
         if quality > 0.0 {

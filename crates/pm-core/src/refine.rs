@@ -1484,6 +1484,12 @@ fn icp_step(
     ))
 }
 
+/// Maximum model points used when ranking pattern-search candidates.  Only
+/// candidate selection is affected: the reported detection score and the
+/// homography stage always use the full point set, where the uniform subset is
+/// representative.
+const PATTERN_SCORE_POINT_CAP: usize = 1024;
+
 /// Pattern-search parameters for the score-based fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PatternSearchParams {
@@ -1531,6 +1537,20 @@ pub fn pattern_search_similarity(
     score_params: &crate::score::ScoreParams,
     params: &PatternSearchParams,
 ) -> Similarity {
+    // Candidate ranking only needs a representative sample of the model
+    // points: the reported detection score is still computed over the full set
+    // by the caller, so a strided subset removes most of the pattern-search
+    // cost without materially changing which local optimum is selected.
+    let cap = PATTERN_SCORE_POINT_CAP;
+    let stride = model_points.len().div_ceil(cap).max(1);
+    let sampled = (stride > 1).then(|| {
+        model_points
+            .iter()
+            .step_by(stride)
+            .copied()
+            .collect::<Vec<_>>()
+    });
+    let model_points = sampled.as_deref().unwrap_or(model_points);
     let mut best = *pose;
     let mut best_score = crate::score::score_similarity(
         model_points,
