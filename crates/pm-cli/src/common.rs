@@ -4,10 +4,20 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use clap::Args;
 use pm_core::{
     Detection, DetectionOverlayOptions, Model, RgbaImage, SearchParams, SearchTimings,
     model_roi_in_model_coords, render_detection_overlay,
 };
+
+/// Shared accuracy-mode flag for commands that build search parameters.
+#[derive(Debug, Args)]
+pub struct AccuracyMode {
+    /// Use the high-accuracy Hough orientation gate (slower Hough, slightly
+    /// better recall on low-contrast and cluttered scenes).
+    #[arg(long)]
+    pub high_accuracy: bool,
+}
 
 /// Load a `.pmodel` file with a path-qualified error.
 pub fn load_model(path: &Path) -> Result<Model> {
@@ -20,30 +30,40 @@ pub fn load_model(path: &Path) -> Result<Model> {
 /// The override may be a complete [`SearchParams`] document, a partial object
 /// (missing fields keep the model defaults, nested objects merge), or a result
 /// file containing a `parameters` object.  Unknown keys are rejected so a typo
-/// cannot silently change nothing.
-pub fn load_params(model: &Model, path: Option<&Path>) -> Result<SearchParams> {
+/// cannot silently change nothing.  `high_accuracy` overrides the orientation
+/// gate after the file is applied.
+pub fn load_params(
+    model: &Model,
+    path: Option<&Path>,
+    high_accuracy: bool,
+) -> Result<SearchParams> {
     let base = SearchParams::from(model.search_defaults);
-    let Some(path) = path else {
-        return Ok(base);
+    let mut params = if let Some(path) = path {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("read parameter file {}", path.display()))?;
+        let mut user: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("parse parameter file {}", path.display()))?;
+        if let Some(parameters) = user.get("parameters") {
+            user = parameters.clone();
+        }
+        if !user.is_object() {
+            bail!(
+                "parameter file {} must contain a JSON object",
+                path.display()
+            );
+        }
+        let mut merged = serde_json::to_value(base).expect("SearchParams serializes");
+        reject_unknown_keys(&merged, &user, path)?;
+        merge_values(&mut merged, &user);
+        serde_json::from_value(merged)
+            .with_context(|| format!("parameter file {} has invalid values", path.display()))?
+    } else {
+        base
     };
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read parameter file {}", path.display()))?;
-    let mut user: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse parameter file {}", path.display()))?;
-    if let Some(parameters) = user.get("parameters") {
-        user = parameters.clone();
+    if high_accuracy {
+        params.orientation_gate = SearchParams::HIGH_ACCURACY_ORIENTATION_GATE;
     }
-    if !user.is_object() {
-        bail!(
-            "parameter file {} must contain a JSON object",
-            path.display()
-        );
-    }
-    let mut merged = serde_json::to_value(base).expect("SearchParams serializes");
-    reject_unknown_keys(&merged, &user, path)?;
-    merge_values(&mut merged, &user);
-    serde_json::from_value(merged)
-        .with_context(|| format!("parameter file {} has invalid values", path.display()))
+    Ok(params)
 }
 
 fn reject_unknown_keys(

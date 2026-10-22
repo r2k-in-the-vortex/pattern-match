@@ -278,6 +278,29 @@ fn params_override_merges_and_rejects_unknown_keys() {
     assert_eq!(document.parameters.score_threshold, 0.99);
     assert_eq!(document.parameters.max_detections, 1);
     assert_eq!(document.parameters.rotation_bins, 60, "defaults preserved");
+    assert_eq!(
+        document.parameters.orientation_gate, 0.08_f32,
+        "fast gate by default"
+    );
+
+    let accuracy_output = dir.join("high-accuracy.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_pm-cli"))
+        .arg("run")
+        .arg("--model")
+        .arg(&model)
+        .arg("--image")
+        .arg(&image)
+        .arg("--output")
+        .arg(&accuracy_output)
+        .arg("--high-accuracy")
+        .output()
+        .expect("run pm-cli");
+    assert_success(&output, "run with high accuracy");
+    let document = load_results(&accuracy_output);
+    assert_eq!(
+        document.parameters.orientation_gate, 0.2_f32,
+        "--high-accuracy selects the wide gate"
+    );
 
     let bad = dir.join("bad.json");
     fs::write(&bad, r#"{"scroe_threshold": 0.5}"#).unwrap();

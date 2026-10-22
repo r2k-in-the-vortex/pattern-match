@@ -34,6 +34,9 @@ pub struct BatchArgs {
     /// Partial or full parameter override JSON.
     #[arg(long, value_name = "FILE")]
     pub params: Option<PathBuf>,
+    /// Accuracy mode options.
+    #[command(flatten)]
+    pub accuracy: common::AccuracyMode,
     /// Exit non-zero when any image has no detections.
     #[arg(long)]
     pub fail_on_none: bool,
@@ -42,7 +45,7 @@ pub struct BatchArgs {
 /// Execute `pm-cli batch`.
 pub fn execute(args: BatchArgs) -> Result<()> {
     let model = common::load_model(&args.model)?;
-    let params = common::load_params(&model, args.params.as_deref())?;
+    let params = common::load_params(&model, args.params.as_deref(), args.accuracy.high_accuracy)?;
     let images = collect_images(&args.input, args.recursive)?;
     if images.is_empty() {
         bail!("no supported images found in {}", args.input.display());

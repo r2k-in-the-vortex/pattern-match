@@ -276,6 +276,22 @@ pub struct SearchParams {
     pub nms: NmsParams,
 }
 
+impl SearchParams {
+    /// Default Hough orientation gate in radians (speed-oriented).
+    ///
+    /// The gate window `2 * gate` covers the rotation step so every
+    /// orientation still passes at least one bin while each pair votes in
+    /// fewer bins.
+    pub const FAST_ORIENTATION_GATE: f32 = 0.08;
+
+    /// Hough orientation gate used by the high-accuracy mode in radians.
+    ///
+    /// This is the pre-optimization value: a wider kernel lets noisy edges
+    /// contribute to more bins, which slightly improves recall on
+    /// low-contrast and cluttered scenes at the cost of Hough time.
+    pub const HIGH_ACCURACY_ORIENTATION_GATE: f32 = 0.20;
+}
+
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
@@ -283,9 +299,14 @@ impl Default for SearchParams {
             rotation_max_deg: 180.0,
             scale_min: 0.5,
             scale_max: 2.0,
+            // The gate must satisfy 2 * gate >= step so every orientation
+            // passes at least one rotation bin: 2 * 0.08 = 0.16 rad covers the
+            // 0.106 rad step of 60 bins.  The tighter gate is what makes each
+            // test/model pair vote in fewer bins; coarser rotation or scale
+            // bins move poses far enough to trip the homography fallback gate.
             rotation_bins: 60,
             scale_bins: 12,
-            orientation_gate: 0.2,
+            orientation_gate: Self::FAST_ORIENTATION_GATE,
             peak_fraction: 0.25,
             peaks_per_bin: 2,
             descriptor_ratio: 0.8,
@@ -710,7 +731,10 @@ fn hough_hypotheses_with_progress(
     let orientation_buckets = HOUGH_ORIENTATION_BUCKETS;
     let bucket_width = std::f32::consts::TAU / orientation_buckets as f32;
     let gate = params.orientation_gate.clamp(0.01, std::f32::consts::PI);
-    let reach = ((gate / bucket_width).ceil() as i32 + 1).max(1);
+    // A model point within `gate` of the target angle can lie at most
+    // `floor(gate / bucket_width) + 1` buckets from the target's bucket; the
+    // extra bucket also covers a point landing exactly on a bucket boundary.
+    let reach = ((gate / bucket_width).floor() as i32 + 1).max(1);
     let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); orientation_buckets];
     let directed = params.polarity_enabled;
     let model_angles: Vec<f32> = model_points
@@ -2093,5 +2117,29 @@ mod tests {
         accumulator.reset();
         assert!(accumulator.values.iter().all(|&value| value == 0.0));
         assert_eq!(accumulator.maximum, 0.0);
+    }
+
+    #[test]
+    fn orientation_gate_modes_cover_the_rotation_step() {
+        let params = SearchParams::default();
+        assert_eq!(
+            params.orientation_gate,
+            SearchParams::FAST_ORIENTATION_GATE,
+            "the default must stay the speed-oriented gate"
+        );
+        let rotations = rotation_bins(&params);
+        assert!(rotations.len() >= 2);
+        let step = rotations[1] - rotations[0];
+        // Every pose angle lies within half a step of a bin, so a gate below
+        // half the step would leave orientations that no bin accepts.
+        for gate in [
+            SearchParams::FAST_ORIENTATION_GATE,
+            SearchParams::HIGH_ACCURACY_ORIENTATION_GATE,
+        ] {
+            assert!(
+                2.0 * gate + 1e-6 >= step,
+                "gate {gate} does not cover step {step}"
+            );
+        }
     }
 }

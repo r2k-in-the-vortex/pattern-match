@@ -520,6 +520,22 @@ impl RunState {
                     .range(0.05..=4.0),
             );
         });
+        let mut high_accuracy =
+            params.orientation_gate >= SearchParams::HIGH_ACCURACY_ORIENTATION_GATE;
+        if ui
+            .checkbox(&mut high_accuracy, "High accuracy")
+            .on_hover_text(
+                "Wider Hough orientation gate (0.20 rad): slower, with slightly better \
+                 recall on low-contrast and cluttered scenes",
+            )
+            .changed()
+        {
+            params.orientation_gate = if high_accuracy {
+                SearchParams::HIGH_ACCURACY_ORIENTATION_GATE
+            } else {
+                SearchParams::FAST_ORIENTATION_GATE
+            };
+        }
         ui.add(egui::Slider::new(&mut params.score_threshold, 0.0..=1.0).text("Score threshold"));
         if ui
             .add(egui::Slider::new(&mut params.coverage_min, 0.0..=1.0).text("Coverage minimum"))

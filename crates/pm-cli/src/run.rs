@@ -29,6 +29,9 @@ pub struct RunArgs {
     /// Partial or full parameter override JSON.
     #[arg(long, value_name = "FILE")]
     pub params: Option<PathBuf>,
+    /// Accuracy mode options.
+    #[command(flatten)]
+    pub accuracy: common::AccuracyMode,
     /// Print stage timings.
     #[arg(long)]
     pub timings: bool,
@@ -40,7 +43,7 @@ pub struct RunArgs {
 /// Execute `pm-cli run`.
 pub fn execute(args: RunArgs) -> Result<()> {
     let model = common::load_model(&args.model)?;
-    let params = common::load_params(&model, args.params.as_deref())?;
+    let params = common::load_params(&model, args.params.as_deref(), args.accuracy.high_accuracy)?;
     let image =
         load_image(&args.image).with_context(|| format!("load image {}", args.image.display()))?;
     let result = detect(&model, &image.gray, &params)

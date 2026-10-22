@@ -26,12 +26,15 @@ pub struct SyntheticArgs {
     /// Partial or full parameter override JSON.
     #[arg(long, value_name = "FILE")]
     pub params: Option<PathBuf>,
+    /// Accuracy mode options.
+    #[command(flatten)]
+    pub accuracy: common::AccuracyMode,
 }
 
 /// Execute `pm-cli bench synthetic`.
 pub fn execute(args: SyntheticArgs) -> Result<()> {
     let model = common::load_model(&args.model)?;
-    let params = common::load_params(&model, args.params.as_deref())?;
+    let params = common::load_params(&model, args.params.as_deref(), args.accuracy.high_accuracy)?;
     let bench_params = SyntheticBenchParams {
         cases: args.cases,
         seed: args.seed,

@@ -1,3 +1,18 @@
+# Preface
+
+Non-AI feature based pattern match is a core industrial CV tool that accurately locates teach object in camera view.
+It's essential tool for industrial vision, not only is it used for robot hand-eye coordination, but also as basis to fixture all other CV measurements.
+So it's often the gatekeeping module for anyone looking to write their own industrial vision suite.
+Each industrial computer vision suite has one, it's the first tool that is required for any industrial vision application.
+Unfortunately open source implementations are not that common, most prefer to go for YoLo type localizations, but those don't give accurate location and orientation of the objects.
+OpenCV and the like don't really perform so well and are not so easy to use.
+So, the question is, in 2026 what does it take to roll your own? Not much evidently, couple dollars in tokens.
+
+Homebrew vision systems have been common in industry for years, especially for Chinese vendors.
+They often use cracked dependencies and so on. Those DIY solutions are about to achieve a whole new level with AI written modules. And it will have to reflect in pricing model of commercial offerings.
+
+This repo explores just where the industry will be heading on this, and I think the answer is much more economical pricing is where the industry is heading. The competition from AI coded alternatives is just too great.
+
 # Pattern Match
 
 A classical, teach-by-example computer-vision tool for locating planar objects with
@@ -545,8 +560,10 @@ search region are ignored.
 Details:
 
 - Rotation bins: default `B_θ = 60` over the configured range (6° nominal), with a
-  smooth orientation kernel rather than hard binning; orientation histograms for model
-  and test points make pair lookup `O(1)` per orientation bin.
+  smooth orientation kernel (`Δθ = 0.08` rad) rather than hard binning.  The gate must
+  satisfy `2Δθ ≥ step` so every orientation passes at least one bin; a wider gate only
+  adds duplicate votes for the same pose.  Orientation histograms for model and test
+  points make pair lookup `O(1)` per orientation bin.
 - Scale bins: default `B_s = 12` log-spaced over `[s_min, s_max]`
   (`s_b = s_min · (s_max/s_min)^(b/(B_s-1))`).
 - Accumulators are reused per `(θ_b, s_b)` to bound memory; peaks are local maxima in a
@@ -991,7 +1008,8 @@ still-image only).
 - Search parameter panel: rotation min/max, scale min/max, max detections, score
   threshold, coverage minimum, polarity on/off, search level (auto/manual),
   hypothesis sources (Hough / descriptors / both), descriptor caps, RANSAC
-  confidence/seed.
+  confidence/seed, and a **High accuracy** toggle that restores the wider (slower)
+  Hough orientation gate.
 - Run/cancel on a worker thread (§5.4). Progress shows the active stage (preprocess,
   edges, Hough/descriptor seeding, verify, refine, homography). Cooperative
   cancellation requires an optional token/progress hook in `pm-core::detect`; it must
@@ -1077,18 +1095,21 @@ the same API.
 ```text
 pm-cli run   --model M.pmodel --image test.png --output results.json
              [--csv results.csv] [--overlay out.png] [--params params.json]
-             [--timings] [--fail-on-none]
+             [--high-accuracy] [--timings] [--fail-on-none]
 pm-cli batch --model M.pmodel --input images/ --output-dir results/
              [--recursive] [--csv all.csv] [--overlay-dir overlays/]
-             [--params params.json] [--fail-on-none]
+             [--params params.json] [--high-accuracy] [--fail-on-none]
 pm-cli model inspect --model M.pmodel [--json]
 pm-cli bench synthetic --model M.pmodel [--cases 200] [--seed 42]
-             [--report report.json] [--params params.json]
+             [--report report.json] [--params params.json] [--high-accuracy]
 ```
 
 `--params` may be a partial or full `SearchParams` document; missing fields keep
 the model defaults, nested objects merge, unknown keys are rejected, and a result
-file's `parameters` object is accepted directly. `--timings` prints stage
+file's `parameters` object is accepted directly. `--high-accuracy` restores the
+pre-optimization Hough orientation gate (0.20 rad instead of the default 0.08),
+which is slower but slightly improves recall on low-contrast and cluttered
+scenes; it overrides any gate in `--params`. `--timings` prints stage
 timings. `batch` mirrors the input directory structure under `--output-dir`,
 ignores non-image files, writes one JSON result per image, and includes an
 `image` column in the combined CSV. Overlay export composites the transformed
@@ -1254,8 +1275,8 @@ SIMD is not the lever for the remaining 180 ms. I removed the SIMD code and the 
 
 The path to lower latency is algorithmic:
 
-1. Hough memory traffic — **implemented**: per-scale accumulator margins, scan/reset limited to each scale's voted bounding box, and a per-rotation gated vote list reused one cache-resident accumulator at a time. Measured ~93 → 26–30 ms, below the 40–50 ms estimate.
-2. Coarse pose count — 60 rotations × 12 scales = 720 bins. Coarse-to-fine angular/scale refinement or fewer bins would cut the dominant cost; this is what Cognex-class implementations do.
+1. Hough memory traffic — **implemented**: per-scale accumulator margins, scan/reset limited to each scale's voted bounding box, and a per-rotation gated vote list reused one cache-resident accumulator at a time. Measured ~93 → 26–30 ms, below the 40–50 ms estimate. -70% improvement for Hough achieved.
+2. Coarse pose count — **implemented (orientation gate + bucket reach)**: the gate narrowed from 0.20 to 0.08 rad, so the gate window spans ~1.5 rotation steps instead of nearly four and each test/model pair votes in far fewer bins.  The orientation-bucket scan also dropped an unnecessary bucket per side: `reach = floor(gate / bucket_width) + 1` provably covers every angle inside the gate.  Isolated Hough fell 26.7 → 14.2 ms (median of 7 runs; −47%), and the full `pm-core` suite passes. Fewer bins themselves are at an accuracy floor: 50 rotations and 11 scale bins make a pure-similarity scene claim a spurious homography, and 30 rotations lose a bracket instance. Coarse-to-fine refinement would have to move inside the Hough stage (e.g. estimating scale from each peak's vote pairs); widening the coarse ICP radius recovered rotation-coarse poses but not scale-coarse ones.  A lossless spatial coarse-to-fine prototype (half- and quarter-resolution translation accumulators refined by the pyramid) saved only 6–9%: the vote loop is throughput-bound, not cache-bound, so fewer votes are the only lever that moves Hough time significantly. Because the narrower gate is a real (if small) recall trade — 87.5% vs 91.5% on the 200-case clean-similarity sweep for the Bracket model, while the pinned acceptance benchmark keeps 100% recall in every scenario — a **High accuracy** option (UI checkbox or `--high-accuracy`) restores the 0.20 rad gate, and the default keeps the speed optimization.
 3. Refine — profile/trim RANSAC and LM iterations (~31 ms).
 4. Skip unused pyramid level — the coarse level is 2 but L3 features are still extracted (~3 ms).
 5. If SIMD is revisited later, the only clean compute-bound targets are descriptor L1 distance (~2–4 ms) and gradient (~1–2 ms); not worth the dependency complexity now.
@@ -1263,6 +1284,8 @@ The path to lower latency is algorithmic:
 Final release timing on this machine: 168.6–182.7 ms across five runs (~177 ms median), down from ~420 ms before parallelization.
 
 After recommendation 1: Hough 26–30 ms (three runs) and end-to-end 112–120 ms (~117 ms median), with detections bit-identical to the pre-change baseline on the bracket and single-instance fixtures; 136 unit, bracket, golden, and synthetic benchmark tests pass.
+
+After recommendation 2: Hough 14.2 ms (isolated median of 7 runs, 12.5–14.8 ms) and end-to-end 98.8–108.9 ms (~102.6 ms median across 7 runs), down from ~117 ms after recommendation 1.  The six bracket instances are still detected, each within 0.1 px of its previous position; 139 unit, 5 CLI, bracket, golden, and synthetic benchmark tests pass.  The High accuracy option restores Hough 24.5 ms and end-to-end ~116.8 ms.
 
 ---
 
@@ -1349,7 +1372,7 @@ path with a synthetic frame source; the hardware camera test is opt-in
 | Minimum edge chain | 4 px |
 | Corner response | Shi–Tomasi `λ_min`, quality 0.01 of max, NMS radius 5 px |
 | Minimum segment | 10 px |
-| Rotation search | `[-180°, 180°]`, 60 bins at coarse level |
+| Rotation search | `[-180°, 180°]`, 60 bins at coarse level; orientation gate 0.08 rad (High accuracy: 0.20 rad) |
 | Scale search | `[0.5, 2.0]`, 12 log bins |
 | Hough orientation bins | 32 model/test orientation buckets, smooth kernel |
 | Hypothesis sources | Hough + corner descriptors + segment pairs (`both`) |
