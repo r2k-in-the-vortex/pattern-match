@@ -2,8 +2,8 @@
 //!
 //! The crate is independent of the UI and file dialogs. The module layout
 //! follows the architecture in the project plan (README §5.2). Detection and
-//! model functionality through M7.5 is implemented; `capture` remains a stub
-//! until the webcam milestone.
+//! model functionality through M8 is implemented, including frame sources for
+//! still images and webcam capture behind the `camera` feature.
 
 pub mod capture;
 pub mod corner;
@@ -25,6 +25,10 @@ pub mod search;
 pub mod segment;
 pub mod synthetic;
 
+pub use capture::{
+    CaptureConfig, CaptureDevice, Frame, FrameSource, ImageFileSource, camera_available,
+    list_cameras, open_webcam,
+};
 pub use descriptor::{
     CornerDescriptor, SegmentPairInvariant, describe_corners, segment_pair_invariants,
 };

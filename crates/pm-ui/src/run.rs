@@ -482,14 +482,14 @@ impl RunState {
                     self.clear_result();
                 }
             });
-            self.parameter_ui(ui);
+            Self::search_parameter_ui(ui, &mut self.params);
         });
         ui.separator();
         self.results_ui(ui);
     }
 
-    fn parameter_ui(&mut self, ui: &mut egui::Ui) {
-        let params = &mut self.params;
+    /// Search-parameter controls shared by still-image and live run modes.
+    pub(crate) fn search_parameter_ui(ui: &mut egui::Ui, params: &mut SearchParams) {
         ui.label("Rotation");
         ui.horizontal(|ui| {
             ui.add(

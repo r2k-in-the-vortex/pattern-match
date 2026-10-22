@@ -9,9 +9,15 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Webcam capture through `nokhwa`'s Windows Media Foundation backend.
+camera = ["dep:nokhwa"]
+
 [dependencies]
 image.workspace = true
 nalgebra.workspace = true
+nokhwa = { workspace = true, optional = true, features = ["input-msmf", "camera-sync-impl"] }
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true

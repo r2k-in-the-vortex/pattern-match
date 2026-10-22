@@ -6,7 +6,7 @@ math-heavy core — transforms, homography estimation, and RANSAC guarantees —
 specified in Lean 4 and its theorems are proven before the corresponding Rust code is
 written.
 
-**Status: M7.5 complete; M8 (webcam/live + packaging) is planned next.** The
+**Status: M8 complete; M9 (hardening and docs) is planned next.** The
 `pm-cli` harness implements `run`, `batch`,
 `model inspect`, and `bench synthetic` against the same `pm-core` detector used by
 the library, with versioned result JSON, CSV export, annotated overlay PNGs,
@@ -30,6 +30,17 @@ optional progress/cancellation hook; with no hook attached, results are unchange
 Validating run mode against a six-instance still image also made coarse candidate
 selection diversity-aware, so the fixed verification budget is spent on distinct poses
 rather than duplicate rotation/scale-bin seeds (§9.4).
+
+M8 adds webcam capture and live mode. `pm-core::capture` defines a backend-neutral
+`FrameSource` with a still-image source and a webcam source behind the `camera`
+feature (Windows Media Foundation through `nokhwa`). MJPEG, YUYV, NV12, GRAY,
+RAWRGB, and RAWBGR frames are converted in Rust, so no C/CMake dependency is added.
+The desktop app enumerates devices, negotiates the nearest supported resolution and
+frame rate, runs capture and detection on separate threads, drops frames instead of
+queuing them, and displays capture rate, processed-frame rate, and capture-to-result
+latency. A frame can be frozen for teaching or copied to the still-image test view,
+and live detection parameters are editable while the stream runs. A release build is
+staged by `scripts/package.ps1`.
 
 The detector is a hybrid similarity search: pyramid oriented Hough voting,
 corner-descriptor and segment-pair seeding, pose clustering, edge-distance
@@ -250,6 +261,9 @@ pattern-match/
 │  │  ├─ tests/
 │  │  └─ benches/
 │  ├─ pm-ui/                  # eframe application binary
+│  │  ├─ src/main.rs          # teach mode, panels, canvas
+│  │  ├─ src/run.rs           # still-image run mode
+│  │  └─ src/live.rs          # webcam capture and live detection
 │  └─ pm-cli/                 # headless CLI
 ├─ lean/
 │  ├─ lakefile.toml
@@ -267,6 +281,10 @@ pattern-match/
 │  └─ synthetic/              # generated benchmark inputs
 ├─ models/
 ├─ scripts/
+│  ├─ ci.sh
+│  ├─ check-sorry.sh
+│  ├─ gen-golden.sh
+│  └─ package.ps1             # Windows release staging
 └─ README.md
 ```
 
@@ -291,7 +309,7 @@ pattern-match/
 | `refine` | Similarity ICP, correspondence assembly, RANSAC, robust homography LM, validation and fallback. |
 | `synthetic` | Deterministic synthetic scene generator and benchmark metrics shared by the CLI and tests. |
 | `result` | Versioned detection-result JSON construction, validation, CSV export, and schema conversion. |
-| `capture` | `FrameSource` trait, image-file source, webcam source (feature-gated). |
+| `capture` | `FrameSource` trait, image-file source, webcam device enumeration/opening (feature-gated), and MJPEG/YUYV/NV12/GRAY/RGB frame conversion. |
 
 ### 5.3 Dependencies
 
@@ -306,11 +324,13 @@ pattern-match/
 | `rfd` | Native file dialogs. |
 | `eframe`, `egui` | Desktop UI, drag-and-drop, custom canvas. |
 | `clap` | CLI parsing. |
-| `nokhwa` (optional feature) | Windows Media Foundation webcam capture. |
+| `nokhwa` (optional, `camera` feature; default-on in `pm-ui`) | Windows Media Foundation webcam capture. |
 | `criterion`, `proptest`, `approx` | Benchmarks, property tests, tolerant comparisons. |
 
 No OpenCV. Image processing primitives are implemented in `pm-core` so subpixel
-behavior and thresholds stay under our control.
+behavior and thresholds stay under our control. Webcam support is gated by the
+`camera` feature (`pm-ui` enables it by default); builds without it still expose the
+`FrameSource` API, the still-image source, and all Teach/Run functionality.
 
 ### 5.4 Threading model
 
@@ -960,8 +980,9 @@ is navigable.
 
 ### 11.3 Run mode (still image; M7.5)
 
-Live camera mode is §11.4 and is delivered by M8. M7.5 implements this still-image
-subset, so the UI can test images before webcam support exists.
+Live camera mode is §11.4. M7.5 implemented this still-image run mode; M8 layers
+webcam capture on top of the same show/cancel/overlay state (run state itself remains
+still-image only).
 
 - Load a test image without unloading the current model. Teach state and run state are
   separate: the model stays active while the test image is displayed, and the teach
@@ -986,16 +1007,40 @@ subset, so the UI can test images before webcam support exists.
 - Save an annotated overlay PNG through the same geometry path as
   `pm-cli run --overlay`.
 
-### 11.4 Live camera
+### 11.4 Live camera (M8)
 
-- Device enumeration and selection; resolution/frame-rate selection where supported.
-- Freeze frame → teach from it, or run continuously.
-- Live overlay uses the latest detection; processed-frame rate and end-to-end latency
-  are shown. Frames are dropped as needed to keep the UI responsive.
-- First version supports webcam/USB via `nokhwa`’s Windows Media Foundation backend
-  behind the `camera` feature. If that backend proves incompatible, `capture.rs` is the
-  abstraction boundary and a `windows` crate Media Foundation implementation can
-  replace it without touching the core.
+- **Device selection.** The Live panel enumerates cameras on first use (and on
+  **Refresh**), showing each device's name. Enumeration runs on a short-lived worker
+  thread, and the device is opened and used on the capture thread; neither runs in the
+  UI thread's COM apartment.
+- **Mode negotiation.** The panel requests a width, height, and frame rate (default
+  1280×720 @ 30 fps) and selects the nearest supported mode from the device's native
+  format list. MJPEG is preferred for USB bandwidth, with YUYV, NV12, GRAY, and raw
+  RGB fallbacks; all are converted in `pm-core::capture`.
+- **Capture and detection threads.** Capture publishes only the newest frame.
+  Detection always consumes the latest frame, so frames that arrive during a slow
+  detection are dropped rather than queued. The UI thread polls shared state and owns
+  all textures, so panning, parameter edits, and mode switches stay responsive.
+- **Live display.** The canvas shows the newest frame, or the latest composite overlay
+  (transformed ROI, zero axes, and matched edges) when **Show detections** is enabled.
+  Capture rate, processed-frame rate, capture-to-result latency, the active detection
+  stage, and the detection count are shown in the panel and status bar.
+- **Freeze and teach.** **Freeze** holds the displayed image (including detections)
+  while the stream keeps running underneath. **Teach from frame** copies the frozen
+  (or latest) frame into teach mode as the source image, and **Use as test image**
+  copies it into still-image run mode. Both buttons work without a loaded model, so a
+  camera frame can be the first model source.
+- **Live parameters.** The right panel contains the same search-parameter controls as
+  still-image run mode. Edits apply to the next processed frame; parameters are
+  snapshotted per frame so a worker never observes a partially updated set.
+- **Backend.** Webcam/USB support uses `nokhwa`'s Windows Media Foundation backend
+  behind the default-on `camera` feature. `capture.rs` remains the abstraction
+  boundary: a different backend can replace it without touching the detector or UI.
+  Builds without the feature still provide Teach and still-image Run modes.
+
+The Windows release is staged with `scripts/package.ps1` into
+`dist/PatternMatch/PatternMatch.exe`; `-Verify` launches the staged executable briefly
+to check that it starts outside the cargo runner.
 
 ### 11.5 Interaction conventions
 
@@ -1126,6 +1171,12 @@ radians to `angle_deg` in `(-180, 180]`, embeds the search parameters, and valid
   synthetic rotation/scale.
 - Masking: feature exclusion and per-level scaling.
 - Serialization: round-trip model/result files; version rejection; malformed input.
+- Capture: image-source sequencing, malformed configuration rejection, and
+  YUYV/NV12/GRAY conversion including row-stride padding. A `#[ignore]` hardware test
+  opens the first camera and reads a frame; the UI live-mode test drives capture,
+  detection, and freeze through a synthetic in-process frame source, so CI needs no
+  camera. A second ignored UI test teaches a model from a real webcam frame and
+  detects the live scene end to end.
 
 ### 13.2 Golden-vector tests
 
@@ -1205,7 +1256,7 @@ pruning, and parallel reductions. GPU acceleration is explicitly future work.
 | M6: Homography refinement | Correspondence assembly, RANSAC H, robust LM, validation/fallback, confidence/diagnostics. | Tilt benchmark meets targets; fallback behavior validated; JSON schema complete. |
 | M7: CLI and benchmark harness | `run`/`batch`/`inspect`/`bench`, JSON/CSV, overlay export, deterministic seeds. | CLI reproduces library results; batch outputs valid files. |
 | M7.5: Still-image UI run mode | Separate run state so a model stays loaded while a test image is opened; search region and parameter panel; worker-thread Run/Cancel with progress; results table/details; JSON/CSV export; canvas overlay of each detection's transformed ROI, zero frame, and matched edges; annotated PNG export. | Model + still test image run entirely from the UI; every detection is visible on the canvas and selectable; exported JSON/CSV detection values and overlay PNG match `pm-cli run` for the same image, parameters, and seed. |
-| M8: Webcam/live + packaging | Webcam source, freeze-frame teaching, live run, Windows release build. | Webcam frame can be taught and detected live; UI remains responsive; packaged exe launches. |
+| M8: Webcam/live + packaging (complete) | Webcam source, freeze-frame teaching, live run, Windows release build. | Webcam frame can be taught and detected live; UI remains responsive; packaged exe launches. |
 | M9: Hardening and docs | Parameter tuning, error handling, file validation, performance profiling, user guide. | CI green; acceptance report; known limitations documented. |
 
 Lean modules M1 and M4 are deliberately placed before the corresponding Rust math.
@@ -1217,6 +1268,14 @@ numerically. M7.5 is the still-image UI prerequisite for M8's live mode: it reus
 `pm-core` detector and result serialization, adding only the optional cancellation and
 progress hook to `detect`; M8 layers camera capture and frame dropping on top of the
 same run state.
+
+M8 is complete. `pm-core::capture` provides image-file and Media Foundation sources
+with in-Rust pixel conversion; the UI has a separate Live mode with device/mode
+selection, capture and detection workers, frame dropping, freeze → teach/test-image,
+and live parameter edits. `scripts/package.ps1` builds and stages the release, with
+`-Verify` launching the staged executable. The live-mode unit test drives the full
+path with a synthetic frame source; the hardware camera test is opt-in
+(`cargo test -p pm-core --features camera -- --ignored`).
 
 ---
 
@@ -1231,7 +1290,7 @@ same run state.
 | Descriptor/segment seeds add false correspondences and compute cost. | Extra hypotheses, possible runtime or score inflation. | Ratio test, mutual consistency checks, strict caps, and the shared edge-based verification; Hough remains primary and source toggles allow diagnosis. |
 | Perspective fit is ill-conditioned on small/near-planar objects. | Bogus homographies. | Strict conditioning and score-improvement gates; explicit similarity fallback with reduced confidence; report `homography_estimated`. |
 | Low-texture parts yield sparse edges. | Low recall. | Adaptive thresholds, contrast weighting, hybrid descriptor/segment seeding, lower resolution options; design accepts confidence degradation. |
-| Webcam crate/backend issues on Windows. | No live mode. | `FrameSource` abstraction; fallback to Media Foundation via the `windows` crate; still-image mode remains fully functional. |
+| Webcam crate/backend issues on Windows. | No live mode. | `FrameSource` abstraction; Media Foundation through `nokhwa`; MJPEG decoded by the pure-Rust `image` crate so the build needs no C/CMake toolchain; still-image modes remain fully functional; the hardware test is opt-in. |
 | Synthetic-only tuning does not generalize. | Poor real-world accuracy. | Keep all thresholds exposed; benchmark harness supports immediate real-image evaluation; plan a tuning phase when images arrive. |
 | Confidence heuristic is not calibrated. | Misleading scores. | Report raw score + diagnostics; mark confidence provisional; add logistic calibration once labeled data exists. |
 | No fixed performance target hides a slow design. | Live mode may be unusable initially. | Stage timings and criterion benches from the first search implementation; frame dropping/throttling; documented optimization path. |
@@ -1288,7 +1347,7 @@ same run state.
 | Homography correspondences | 180 edge points, 80 corners, 40 segment endpoints; edge search ±3 px; corner/segment gates 8 px |
 | Homography LM | 20 iterations per round, 3 re-association rounds, Cauchy σ 1.5 px |
 | Homography acceptance | score improvement ≥ 0.01; minimum 6 inliers and 12 correspondences; ≥ 8 corner inliers when corners exist; matrix condition ≤ 10⁶; perspective-term relative change ≤ 0.35 |
-| Camera default | device-provided, preferably 1280×720; live processing may throttle |
+| Camera default | request 1280×720 @ 30 fps; nearest supported device mode; frames dropped rather than queued |
 | Confidence | heuristic §9.9 until calibrated; clamped to `[0,1]` |
 
 All defaults are exposed in the UI/CLI parameter files and are expected to change as

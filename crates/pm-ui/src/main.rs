@@ -3,16 +3,19 @@
 //! M3 adds teach mode: a rotated ROI, zero frame, mask tools with undo/redo,
 //! model save/load, and the trainable model summary.  M7.5 adds still-image run
 //! mode with a separate test image, worker-thread detection, results inspection,
-//! and JSON/CSV/overlay export.
+//! and JSON/CSV/overlay export.  M8 adds live webcam mode with device and mode
+//! selection, freeze-frame teaching, and frame-dropping live detection.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod live;
 mod run;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
+use live::LiveState;
 use pm_core::{
     FeatureParams, FeatureSet, GrayF32, LoadedImage, MaskBounds, MaskPrimitive, MaskRaster, Model,
     OverlayOptions, RgbaImage, RotatedRect, SearchDefaults, TeachSettings, ZeroFrame,
@@ -31,6 +34,8 @@ enum Mode {
     Teach,
     /// Run the loaded model against a still test image.
     Run,
+    /// Preview and detect on a live camera stream.
+    Live,
 }
 
 fn main() -> eframe::Result {
@@ -91,6 +96,7 @@ pub(crate) enum RoiDrag {
 struct PatternMatchApp {
     mode: Mode,
     run: RunState,
+    live: LiveState,
     loaded: Option<LoadedImage>,
     source_available: bool,
     features: Option<FeatureSet>,
@@ -132,6 +138,7 @@ impl Default for PatternMatchApp {
         Self {
             mode: Mode::Teach,
             run: RunState::default(),
+            live: LiveState::default(),
             loaded: None,
             source_available: false,
             features: None,
@@ -179,6 +186,7 @@ impl PatternMatchApp {
         } else if self.mode == Mode::Run {
             self.open_test_image(ctx, path);
         } else {
+            self.mode = Mode::Teach;
             self.load(ctx, path);
         }
     }
@@ -197,38 +205,52 @@ impl PatternMatchApp {
     fn load(&mut self, ctx: &egui::Context, path: PathBuf) {
         match load_image(&path) {
             Ok(loaded) => {
-                self.image_texture = Some(texture_from_rgba(ctx, "source", &loaded.display));
-                self.loaded = Some(loaded);
-                self.source_available = true;
-                self.model_name = path.file_stem().map_or_else(
+                let name = path.file_stem().map_or_else(
                     || "model".to_owned(),
                     |stem| stem.to_string_lossy().into_owned(),
                 );
-                self.image_path = Some(path);
-                self.model_path = None;
-                self.model = None;
-                self.model_dirty = false;
-                self.run.clear_model();
-                self.roi = None;
-                self.zero = None;
-                self.mask_primitives.clear();
-                self.undo_stack.clear();
-                self.redo_stack.clear();
-                self.polygon_points.clear();
-                self.brush_stroke = None;
-                self.roi_drag = None;
-                self.zero_rotating = false;
-                self.show_masked = false;
-                self.tool = Tool::Select;
-                self.params_dirty = false;
-                self.params_changed_at = None;
-                self.re_extract(ctx);
+                self.set_source_image(ctx, loaded, name, Some(path));
                 self.status = "Image loaded. Draw an ROI to begin teaching.".to_owned();
             }
             Err(error) => {
                 self.status = format!("Failed to load {}: {error}", path.display());
             }
         }
+    }
+
+    /// Replace the teach source image, resetting teach and run state.  The
+    /// image may come from disk, an embedded model source, or a live frame.
+    fn set_source_image(
+        &mut self,
+        ctx: &egui::Context,
+        loaded: LoadedImage,
+        model_name: String,
+        path: Option<PathBuf>,
+    ) {
+        self.image_texture = Some(texture_from_rgba(ctx, "source", &loaded.display));
+        self.loaded = Some(loaded);
+        self.source_available = true;
+        self.model_name = model_name;
+        self.image_path = path;
+        self.model_path = None;
+        self.model = None;
+        self.model_dirty = false;
+        self.run.clear_model();
+        self.live.clear_model();
+        self.roi = None;
+        self.zero = None;
+        self.mask_primitives.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.polygon_points.clear();
+        self.brush_stroke = None;
+        self.roi_drag = None;
+        self.zero_rotating = false;
+        self.show_masked = false;
+        self.tool = Tool::Select;
+        self.params_dirty = false;
+        self.params_changed_at = None;
+        self.re_extract(ctx);
     }
 
     fn re_extract(&mut self, ctx: &egui::Context) {
@@ -408,6 +430,7 @@ impl PatternMatchApp {
                     self.model_path = Some(path);
                     self.model_dirty = false;
                     self.run.configure_for_model(defaults);
+                    self.live.configure_for_model(defaults);
                 }
                 Err(error) => {
                     self.status = format!("Failed to save model: {error}");
@@ -472,6 +495,7 @@ impl PatternMatchApp {
                 let defaults = model.search_defaults;
                 self.model = Some(model);
                 self.run.configure_for_model(defaults);
+                self.live.configure_for_model(defaults);
                 self.refresh_preview_overlay(ctx);
                 self.status = if has_source {
                     format!("Opened {}.", path.display())
@@ -878,7 +902,15 @@ impl eframe::App for PatternMatchApp {
         if let Some(status) = self.run.poll(&ctx) {
             self.status = status;
         }
+        if let Some(status) = self.live.poll(&ctx) {
+            self.status = status;
+        }
 
+        let mut live_start_requested = false;
+        let mut live_stop_requested = false;
+        let mut live_freeze_toggle = false;
+        let mut live_teach_requested = false;
+        let mut live_test_requested = false;
         let mut open_image_requested = false;
         let mut open_model_requested = false;
         let mut save_model_requested = false;
@@ -897,6 +929,7 @@ impl eframe::App for PatternMatchApp {
                 ui.separator();
                 ui.selectable_value(&mut self.mode, Mode::Teach, "Teach");
                 ui.selectable_value(&mut self.mode, Mode::Run, "Run");
+                ui.selectable_value(&mut self.mode, Mode::Live, "Live");
                 ui.separator();
                 match self.mode {
                     Mode::Teach => {
@@ -975,6 +1008,52 @@ impl eframe::App for PatternMatchApp {
                         }
                         ui.separator();
                         ui.checkbox(&mut self.run.show_detections, "Detections");
+                    }
+                    Mode::Live => {
+                        if ui.button("Open model…").clicked() {
+                            open_model_requested = true;
+                        }
+                        ui.separator();
+                        if self.live.is_running() {
+                            if ui.button("Stop camera").clicked() {
+                                live_stop_requested = true;
+                            }
+                        } else if ui
+                            .add_enabled(self.live.can_start(), egui::Button::new("Start camera"))
+                            .clicked()
+                        {
+                            live_start_requested = true;
+                        }
+                        if self.live.is_frozen() {
+                            if ui.button("Resume").clicked() {
+                                live_freeze_toggle = true;
+                            }
+                        } else if ui
+                            .add_enabled(self.live.has_frame(), egui::Button::new("Freeze"))
+                            .clicked()
+                        {
+                            live_freeze_toggle = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.live.has_frame(),
+                                egui::Button::new("Teach from frame"),
+                            )
+                            .clicked()
+                        {
+                            live_teach_requested = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.live.has_frame(),
+                                egui::Button::new("Use as test image"),
+                            )
+                            .clicked()
+                        {
+                            live_test_requested = true;
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut self.live.show_detections, "Detections");
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1055,6 +1134,11 @@ impl eframe::App for PatternMatchApp {
                                 self.run.set_image(&ctx, loaded, None);
                                 self.status = "Teach image copied to the test image.".to_owned();
                             }
+                        }
+                    }
+                    Mode::Live => {
+                        if self.live.left_panel(ui, self.model.is_some()) {
+                            live_start_requested = true;
                         }
                     }
                 });
@@ -1207,6 +1291,7 @@ impl eframe::App for PatternMatchApp {
                         let running = self.run.is_running();
                         self.run.right_panel(ui, has_model, running);
                     }
+                    Mode::Live => self.live.right_panel(ui, self.model.is_some()),
                 });
             });
 
@@ -1237,6 +1322,20 @@ impl eframe::App for PatternMatchApp {
                             ui.label(format!("{} detection(s)", self.run.detection_count()));
                         }
                     }
+                    Mode::Live => {
+                        ui.label(format!(
+                            "capture {:.1} fps · processed {:.1} fps · {:.0} ms",
+                            self.live.capture_fps(),
+                            self.live.processed_fps(),
+                            self.live.latency_ms()
+                        ));
+                        ui.separator();
+                        if let Some((stage, fraction)) = self.live.stage() {
+                            ui.label(format!("{} {:.0}%", stage.as_str(), fraction * 100.0));
+                        } else {
+                            ui.label(format!("{} detection(s)", self.live.detection_count()));
+                        }
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("pm-ui {}", env!("CARGO_PKG_VERSION")));
@@ -1248,6 +1347,7 @@ impl eframe::App for PatternMatchApp {
             .show(ui, |ui| match self.mode {
                 Mode::Teach => self.draw_canvas(ui),
                 Mode::Run => self.run.draw_canvas(ui, self.model.as_ref()),
+                Mode::Live => self.live.draw_canvas(ui),
             })
             .inner;
         self.cursor_px = cursor;
@@ -1299,6 +1399,40 @@ impl eframe::App for PatternMatchApp {
         if cancel_requested {
             self.run.cancel();
             self.status = "Cancelling detection…".to_owned();
+        }
+
+        if live_start_requested {
+            match self.live.start(&ctx, self.model.clone()) {
+                Ok(()) => self.status = "Camera starting…".to_owned(),
+                Err(error) => self.status = error,
+            }
+        }
+        if live_stop_requested {
+            self.live.stop();
+            self.status = "Camera stopped.".to_owned();
+        }
+        if live_freeze_toggle {
+            if self.live.is_frozen() {
+                self.live.unfreeze();
+            } else {
+                self.live.freeze();
+            }
+        }
+        if live_teach_requested && let Some(frame) = self.live.snapshot_frame() {
+            self.set_source_image(&ctx, frame, "camera".to_owned(), None);
+            self.mode = Mode::Teach;
+            self.status =
+                "Camera frame loaded for teaching. Draw an ROI and zero frame.".to_owned();
+        }
+        if live_test_requested && let Some(frame) = self.live.snapshot_frame() {
+            self.run.set_image(&ctx, frame, None);
+            self.live.stop();
+            self.mode = Mode::Run;
+            self.status = "Camera frame copied to the test image.".to_owned();
+        }
+        if self.mode != Mode::Live {
+            // Release the device when the user leaves Live mode.
+            self.live.stop();
         }
 
         let export_stem = self
@@ -1919,6 +2053,45 @@ mod tests {
         for path in [image_path, model_path, json_path, csv_path, png_path] {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn camera_frame_can_become_the_teach_source() {
+        let (width, height) = (96, 72);
+        let mut data = vec![0.12_f32; width * height];
+        for y in 14..58 {
+            for x in 14..82 {
+                data[y * width + x] = 0.86;
+            }
+        }
+        let gray = GrayF32::new(width, height, data).expect("test image");
+        let frame = LoadedImage {
+            display: gray.display_rgba(),
+            gray,
+        };
+
+        let ctx = egui::Context::default();
+        let mut app = PatternMatchApp::default();
+        app.set_source_image(&ctx, frame, "camera".to_owned(), None);
+        assert!(app.loaded.is_some());
+        assert!(app.image_path.is_none());
+        assert_eq!(app.model_name, "camera");
+        assert!(app.features.as_ref().is_some_and(|f| f.edge_count() > 0));
+        assert!(app.image_texture.is_some());
+        assert!(app.overlay_texture.is_some());
+        assert!(app.model.is_none(), "a new source clears the old model");
+
+        app.roi = Some(RotatedRect::new(48.0, 36.0, 70.0, 50.0, 0.0));
+        app.zero = Some(ZeroFrame {
+            origin: [48.0, 36.0],
+            angle: 0.0,
+        });
+        let path =
+            std::env::temp_dir().join(format!("pm-ui-camera-teach-{}.pmodel", std::process::id()));
+        app.save_model(path.clone());
+        assert!(app.model.is_some(), "the in-memory frame can be taught");
+        assert_eq!(app.model_name, "camera");
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

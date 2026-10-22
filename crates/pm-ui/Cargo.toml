@@ -9,6 +9,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["camera"]
+# Webcam capture; without it, still-image Teach and Run modes still work.
+camera = ["pm-core/camera"]
+
 [dependencies]
 pm-core.workspace = true
 eframe.workspace = true

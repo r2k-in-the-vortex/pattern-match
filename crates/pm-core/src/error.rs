@@ -23,6 +23,10 @@ pub enum Error {
     #[error("numerical failure: {0}")]
     Numerical(String),
 
+    /// A camera or other hardware frame source failed.
+    #[error("capture error: {0}")]
+    Capture(String),
+
     /// The caller cancelled a long-running operation through its progress hook.
     #[error("cancelled")]
     Cancelled,
