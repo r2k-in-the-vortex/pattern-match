@@ -18,6 +18,12 @@ The way I see it, that puts completely custom, in house developed, vision vision
 
 Even in open source case, the typical barrier, that nobody in company is familiar with codebase and able to make necessary modifications, that dissapears. The codebase familiarity and actual modifications get done by AI anyway.
 
+
+
+https://github.com/user-attachments/assets/6d5d6daa-b813-4395-828f-08033ec8e497
+
+
+
 # Pattern Match
 
 A classical, teach-by-example computer-vision tool for locating planar objects with
