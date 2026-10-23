@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Installs the toolchain from lean/lean-toolchain, restores the Mathlib
       # cache, caches lean/.lake, and runs `lake build` (README §10.5 step 1).
@@ -38,7 +38,7 @@ jobs:
           use-github-cache: true
 
       - name: Reject sorry in core proofs
-        run: ./scripts/check-sorry.sh
+        run: bash scripts/check-sorry.sh
 
       - name: Check golden vectors are current
         shell: bash
@@ -56,7 +56,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +81,7 @@ jobs:
     needs: rust
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -109,7 +109,7 @@ jobs:
           Copy-Item target/release/pm-cli.exe dist/PatternMatch/pm-cli.exe
 
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pattern-match-windows-x64
           path: dist/PatternMatch
