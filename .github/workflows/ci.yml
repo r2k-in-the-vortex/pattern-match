@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lean:
+    name: Lean specification
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain from lean/lean-toolchain, restores the Mathlib
+      # cache, caches lean/.lake, and runs `lake build` (README §10.5 step 1).
+      - name: Install Lean, restore Mathlib cache, build
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lean
+          build: true
+          test: false
+          lint: false
+          use-mathlib-cache: true
+          use-github-cache: true
+
+      - name: Reject sorry in core proofs
+        run: ./scripts/check-sorry.sh
+
+      - name: Check golden vectors are current
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          (cd lean && lake exe golden) > "$tmp"
+          if ! diff -u testdata/golden/vectors.json "$tmp"; then
+            echo "::error::testdata/golden/vectors.json is stale; run scripts/gen-golden.sh"
+            exit 1
+          fi
+
+  rust:
+    name: Rust validation (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-features --locked
+
+  build:
+    name: Release build (Windows x64)
+    runs-on: windows-latest
+    needs: rust
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Build release workspace
+        run: cargo build --release --workspace --all-features --locked
+
+      - name: Smoke-test the release CLI
+        shell: pwsh
+        run: |
+          ./target/release/pm-cli.exe model inspect --model models/Bracket.pmodel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./target/release/pm-cli.exe bench synthetic --model models/Bracket.pmodel --cases 3 --seed 42
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage the Windows package
+        shell: pwsh
+        run: |
+          ./scripts/package.ps1 -NoBuild
+          Copy-Item target/release/pm-cli.exe dist/PatternMatch/pm-cli.exe
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pattern-match-windows-x64
+          path: dist/PatternMatch
+          if-no-files-found: error
+          retention-days: 14

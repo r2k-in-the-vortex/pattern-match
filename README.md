@@ -260,6 +260,9 @@ changes the reported pose, never the extracted feature geometry.
 
 ```text
 pattern-match/
+├─ .github/
+│  └─ workflows/
+│     └─ ci.yml               # GitHub Actions: Lean proofs, Rust checks, release build
 ├─ Cargo.toml                # workspace
 ├─ crates/
 │  ├─ pm-core/               # algorithms; no UI dependencies
@@ -966,6 +969,16 @@ CI checks, in order:
 2. Regenerate golden vectors; fail if the committed file differs.
 3. `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace`.
 4. A quick synthetic benchmark smoke test and release-mode timings.
+
+`.github/workflows/ci.yml` runs these checks on GitHub Actions. A Linux job installs
+the pinned toolchain and Mathlib cache through the official `lean-action`, caches
+`.lake`, and runs `lake build`; it then runs `scripts/check-sorry.sh` and fails if
+`lake exe golden` differs from `testdata/golden/vectors.json`. A Windows job runs
+`cargo fmt --check`, clippy with `-D warnings`, and `cargo test --workspace
+--all-features`. A third Windows job builds the release workspace, smoke-tests the
+release `pm-cli` against `models/Bracket.pmodel`, stages `dist/PatternMatch` with
+`scripts/package.ps1 -NoBuild`, and uploads it as the `pattern-match-windows-x64`
+artifact. `scripts/ci.sh` remains the local mirror of the pre-build checks.
 
 A theorem is not considered done until its Rust counterpart is linked in code
 comments/tests by theorem ID (`G3`, `D5`, `R5`, …), so the spec-to-implementation map
