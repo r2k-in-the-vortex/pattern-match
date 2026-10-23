@@ -13,6 +13,11 @@ They often use cracked dependencies and so on. Those DIY solutions are about to 
 
 This repo explores just where the industry will be heading on this, and I think the answer is much more economical pricing is where the industry is heading. The competition from AI coded alternatives is just too great.
 
+The results here are delivered for less than 10usd in tokens.
+The way I see it, that puts completely custom, in house developed, vision vision system in the hands of every automation company that has a software engineer on payroll. Or maybe a top quality open source suite of software will appear, ready to play as is.
+
+Even in open source case, the typical barrier, that nobody in company is familiar with codebase and able to make necessary modifications, that dissapears. The codebase familiarity and actual modifications get done by AI anyway.
+
 # Pattern Match
 
 A classical, teach-by-example computer-vision tool for locating planar objects with
@@ -1305,7 +1310,8 @@ After recommendation 3: refine 16.9â€“17.9 ms (median 17.6) and end-to-end 86.6â
 | M7: CLI and benchmark harness | `run`/`batch`/`inspect`/`bench`, JSON/CSV, overlay export, deterministic seeds. | CLI reproduces library results; batch outputs valid files. |
 | M7.5: Still-image UI run mode | Separate run state so a model stays loaded while a test image is opened; search region and parameter panel; worker-thread Run/Cancel with progress; results table/details; JSON/CSV export; canvas overlay of each detection's transformed ROI, zero frame, and matched edges; annotated PNG export. | Model + still test image run entirely from the UI; every detection is visible on the canvas and selectable; exported JSON/CSV detection values and overlay PNG match `pm-cli run` for the same image, parameters, and seed. |
 | M8: Webcam/live + packaging (complete) | Webcam source, freeze-frame teaching, live run, Windows release build. | Webcam frame can be taught and detected live; UI remains responsive; packaged exe launches. |
-| M9: Hardening and docs | Parameter tuning, error handling, file validation, performance profiling, user guide. | CI green; acceptance report; known limitations documented. |
+
+With M8 complete, the project is delivered, the point is made. Further work makes sense if pattern match is included in a wider vision system.
 
 Lean modules M1 and M4 are deliberately placed before the corresponding Rust math.
 Feature and UI work (M2/M3) can proceed in parallel with proof work because it does not
