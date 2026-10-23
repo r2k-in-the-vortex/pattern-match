@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # A release tag must name the version in Cargo.toml, so a mistyped or
+      # stale tag cannot publish binaries with the wrong version stamped in.
+      - name: Verify tag matches the workspace version
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Tag '$tag' is not a release tag (expected vX.Y.Z)."
+          }
+          $tagVersion = $Matches[1]
+          $manifest = Get-Content -Raw -LiteralPath Cargo.toml
+          if ($manifest -notmatch '(?m)^version = "([^"]+)"') {
+            throw "Could not read the workspace version from Cargo.toml."
+          }
+          $workspaceVersion = $Matches[1]
+          if ($tagVersion -ne $workspaceVersion) {
+            throw "Tag '$tag' does not match workspace version '$workspaceVersion' in Cargo.toml."
+          }
+          Write-Host "Releasing $tag (workspace version $workspaceVersion)."
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build release workspace
+        run: cargo build --release --workspace --all-features --locked
+
+      - name: Stage and archive the Windows package
+        shell: pwsh
+        run: |
+          ./scripts/package.ps1 -NoBuild
+          Copy-Item target/release/pm-cli.exe dist/PatternMatch/pm-cli.exe
+          Compress-Archive -Path dist/PatternMatch/* -DestinationPath "dist/pattern-match-$env:GITHUB_REF_NAME-windows-x64.zip"
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "dist/pattern-match-$env:GITHUB_REF_NAME-windows-x64.zip" `
+            --title "Pattern Match $env:GITHUB_REF_NAME" `
+            --verify-tag `
+            --generate-notes

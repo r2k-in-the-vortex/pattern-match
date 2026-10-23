@@ -3337,7 +3337,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "pm-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3347,7 +3347,7 @@ dependencies = [
 
 [[package]]
 name = "pm-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "image",
  "nalgebra",
@@ -3361,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "pm-ui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "eframe",
  "image",

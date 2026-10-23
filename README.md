@@ -262,7 +262,8 @@ changes the reported pose, never the extracted feature geometry.
 pattern-match/
 ├─ .github/
 │  └─ workflows/
-│     └─ ci.yml               # GitHub Actions: Lean proofs, Rust checks, release build
+│     ├─ ci.yml               # GitHub Actions: Lean proofs, Rust checks, release build
+│     └─ release.yml          # Tag-triggered GitHub Release with the Windows package
 ├─ Cargo.toml                # workspace
 ├─ crates/
 │  ├─ pm-core/               # algorithms; no UI dependencies
@@ -979,6 +980,10 @@ the pinned toolchain and Mathlib cache through the official `lean-action`, cache
 release `pm-cli` against `models/Bracket.pmodel`, stages `dist/PatternMatch` with
 `scripts/package.ps1 -NoBuild`, and uploads it as the `pattern-match-windows-x64`
 artifact. `scripts/ci.sh` remains the local mirror of the pre-build checks.
+`.github/workflows/release.yml` runs on `v*` tags: it rejects a tag that does not
+match the workspace version in `Cargo.toml`, tests and builds the release, stages
+`dist/PatternMatch`, and publishes a GitHub Release with
+`pattern-match-<tag>-windows-x64.zip`.
 
 A theorem is not considered done until its Rust counterpart is linked in code
 comments/tests by theorem ID (`G3`, `D5`, `R5`, …), so the spec-to-implementation map
